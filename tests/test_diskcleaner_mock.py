@@ -566,6 +566,77 @@ class DiskCleanerMockTest(unittest.TestCase):
             paths = cleaner._download_file_media_paths("h1")
             self.assertEqual([p.as_posix() for p in paths], [media_file.as_posix()])
 
+    def test_task_operator_init_exception_is_caught(self):
+        cleaner = self._new_cleaner()
+        cleaner._transfer_oper = None
+        cleaner._download_oper = SimpleNamespace()
+        cleaner._mediaserver_oper = SimpleNamespace()
+
+        original_transfer_oper = self.plugin_mod.TransferHistoryOper
+
+        class _BrokenTransferOper:
+            def __init__(self):
+                raise RuntimeError("init failed")
+
+        self.plugin_mod.TransferHistoryOper = _BrokenTransferOper
+        try:
+            cleaner._task()
+        finally:
+            self.plugin_mod.TransferHistoryOper = original_transfer_oper
+
+        run_history = cleaner.get_data("run_history") or []
+        self.assertTrue(run_history)
+        self.assertEqual((run_history[-1] or {}).get("status"), "failed")
+
+    def test_pick_longest_seeding_torrent_handles_get_completed_torrents_exception(self):
+        cleaner = self._new_cleaner()
+        original_downloader_helper = self.plugin_mod.DownloaderHelper
+
+        class _BrokenInstance:
+            @staticmethod
+            def get_completed_torrents():
+                raise RuntimeError("downloader error")
+
+        class _FakeDownloaderHelper:
+            def get_services(self, name_filters=None):
+                return {"qb": SimpleNamespace(instance=_BrokenInstance())}
+
+        self.plugin_mod.DownloaderHelper = _FakeDownloaderHelper
+        try:
+            result = cleaner._pick_longest_seeding_torrent(min_days=None, skipped_hashes=set())
+        finally:
+            self.plugin_mod.DownloaderHelper = original_downloader_helper
+
+        self.assertIsNone(result)
+
+    def test_calc_usage_handles_space_usage_exception(self):
+        cleaner = self._new_cleaner()
+        usage = cleaner._calc_usage([Path("/tmp/noop")])
+        self.assertEqual((usage or {}).get("total"), 0)
+        self.assertEqual((usage or {}).get("free"), 0)
+
+    def test_run_retry_job_wraps_retry_payload_exception(self):
+        cleaner = self._new_cleaner()
+        cleaner._retry_max_attempts = 3
+        cleaner._retry_torrent_payload = lambda payload: (_ for _ in ()).throw(RuntimeError("retry boom"))
+
+        action, next_job = cleaner._run_retry_job(
+            {"attempt": 0, "payload": {"mode": "torrent", "trigger": "t", "target": "x"}}
+        )
+
+        self.assertIsNotNone(action)
+        self.assertIn("失败", (action or {}).get("action", ""))
+        self.assertIsNotNone(next_job)
+        self.assertEqual((next_job or {}).get("attempt"), 1)
+
+    def test_count_download_records_handles_oper_exception(self):
+        cleaner = self._new_cleaner()
+        cleaner._download_oper = SimpleNamespace(
+            get_by_hash=lambda _hash: (_ for _ in ()).throw(RuntimeError("db err")),
+            get_files_by_hash=lambda _hash: [],
+        )
+        self.assertEqual(cleaner._count_download_records("h1"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

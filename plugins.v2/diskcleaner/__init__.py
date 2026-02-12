@@ -32,7 +32,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.16"
+    plugin_version = "0.17"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -1186,15 +1186,15 @@ class DiskCleaner(_PluginBase):
             logger.error(f"{self.plugin_name}停止服务失败：{err}")
 
     def _task(self):
-        if not self._transfer_oper:
-            self._transfer_oper = TransferHistoryOper()
-        if not self._download_oper:
-            self._download_oper = DownloadHistoryOper()
-        if not self._mediaserver_oper:
-            self._mediaserver_oper = MediaServerOper()
-
         with self._lock:
             try:
+                if not self._transfer_oper:
+                    self._transfer_oper = TransferHistoryOper()
+                if not self._download_oper:
+                    self._download_oper = DownloadHistoryOper()
+                if not self._mediaserver_oper:
+                    self._mediaserver_oper = MediaServerOper()
+
                 logger.info(f"{self.plugin_name}开始执行")
                 run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._current_run_freed_bytes = 0
@@ -2193,7 +2193,11 @@ class DiskCleaner(_PluginBase):
 
     def _pick_longest_seeding_torrent(self, min_days: Optional[int], skipped_hashes: set) -> Optional[dict]:
         name_filters = self._downloaders if self._downloaders else None
-        services = DownloaderHelper().get_services(name_filters=name_filters)
+        try:
+            services = DownloaderHelper().get_services(name_filters=name_filters)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取下载器列表失败：{err}")
+            return None
         if not services:
             return None
 
@@ -2207,7 +2211,11 @@ class DiskCleaner(_PluginBase):
             if hasattr(instance, "is_inactive") and instance.is_inactive():
                 continue
 
-            torrents = instance.get_completed_torrents() or []
+            try:
+                torrents = instance.get_completed_torrents() or []
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}读取下载器完成任务失败 {downloader_name}：{err}")
+                continue
             for torrent in torrents:
                 torrent_hash = self._torrent_hash(torrent)
                 if not torrent_hash or torrent_hash in skipped_hashes:
@@ -2235,13 +2243,23 @@ class DiskCleaner(_PluginBase):
         }
 
     def _download_paths(self) -> List[Path]:
+        try:
+            dirs = DirectoryHelper().get_local_download_dirs() or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取下载目录失败：{err}")
+            return []
         return self._unique_existing_paths(
-            [Path(item.download_path) for item in DirectoryHelper().get_local_download_dirs() if item.download_path]
+            [Path(item.download_path) for item in dirs if getattr(item, "download_path", None)]
         )
 
     def _library_paths(self) -> List[Path]:
+        try:
+            dirs = DirectoryHelper().get_local_library_dirs() or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取媒体库目录失败：{err}")
+            return []
         all_library_paths = self._unique_existing_paths(
-            [Path(item.library_path) for item in DirectoryHelper().get_local_library_dirs() if item.library_path]
+            [Path(item.library_path) for item in dirs if getattr(item, "library_path", None)]
         )
         if not self._media_servers and not self._media_libraries:
             return all_library_paths
@@ -2304,7 +2322,12 @@ class DiskCleaner(_PluginBase):
             self._library_scope_cache = []
             return self._library_scope_cache
 
-        services = MediaServerHelper().get_services(name_filters=selected_servers)
+        try:
+            services = MediaServerHelper().get_services(name_filters=selected_servers)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取媒体库服务失败：{err}")
+            self._library_scope_cache = []
+            return self._library_scope_cache
         if not services:
             self._library_scope_cache = []
             return self._library_scope_cache
@@ -2407,7 +2430,11 @@ class DiskCleaner(_PluginBase):
         return list(unique.values())
 
     def _calc_usage(self, paths: List[Path]) -> dict:
-        total, free = SystemUtils.space_usage(paths)
+        try:
+            total, free = SystemUtils.space_usage(paths)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}统计磁盘空间失败：{err}")
+            total, free = 0, 0
         used = max(0, total - free)
         free_percent = (free * 100 / total) if total else 0
         used_percent = (used * 100 / total) if total else 0
@@ -2884,12 +2911,21 @@ class DiskCleaner(_PluginBase):
         payload = job.get("payload") or {}
         mode = payload.get("mode")
         attempt = int(job.get("attempt", 0) or 0) + 1
-        if mode == "media":
-            result = self._retry_media_payload(payload)
-        elif mode == "torrent":
-            result = self._retry_torrent_payload(payload)
-        else:
+        if mode not in {"media", "torrent"}:
             return None, None
+        try:
+            if mode == "media":
+                result = self._retry_media_payload(payload)
+            else:
+                result = self._retry_torrent_payload(payload)
+        except Exception as err:
+            logger.error(f"{self.plugin_name}失败补偿任务执行异常 mode={mode} target={payload.get('target')}: {err}", exc_info=True)
+            result = {
+                "steps": {},
+                "failed_steps": ["job_exception"],
+                "freed_bytes": 0,
+                "refresh_items": [],
+            }
 
         failed_steps = result.get("failed_steps") or []
         ok = len(failed_steps) == 0
@@ -3305,11 +3341,15 @@ class DiskCleaner(_PluginBase):
     def _count_download_records(self, download_hash: Optional[str]) -> int:
         if not self._download_oper or not download_hash:
             return 0
-        count = 0
-        if self._download_oper.get_by_hash(download_hash):
-            count += 1
-        count += len(self._download_oper.get_files_by_hash(download_hash) or [])
-        return count
+        try:
+            count = 0
+            if self._download_oper.get_by_hash(download_hash):
+                count += 1
+            count += len(self._download_oper.get_files_by_hash(download_hash) or [])
+            return count
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}统计下载记录数量失败，已忽略 hash={download_hash}: {err}")
+            return 0
 
     @staticmethod
     def _path_size(path: Path) -> int:
