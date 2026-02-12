@@ -37,5 +37,18 @@
             "v0.2": "电视剧电影以及综艺的分类",
             "v0.1": "初始化版本猫眼订阅功能"
           }
+    },
+    "DiskCleaner": {
+        "name": "磁盘清理",
+        "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
+        "version": "0.2",
+        "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png",
+        "color": "#4CAF50",
+        "author": "逗猫",
+        "level": 2,
+        "history": {
+            "v0.2": "新增演练模式、冷却时间、单轮/单日释放上限、近期入库保护、路径白名单/黑名单、仅MP关联任务安全增强。",
+            "v0.1": "首个版本：支持资源目录/媒体库阈值监听、下载器做种时长监听、联动删除与媒体库刷新。"
+          }
     }
 }
