@@ -27,7 +27,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "0.2"
+    plugin_version = "0.3"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_config_prefix = "diskcleaner_"
@@ -163,10 +163,10 @@ class DiskCleaner(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         downloader_items = [
@@ -656,7 +656,7 @@ class DiskCleaner(_PluginBase):
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def stop_service(self):
         try:
