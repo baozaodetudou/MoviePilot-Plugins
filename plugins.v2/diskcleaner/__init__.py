@@ -30,7 +30,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "0.4"
+    plugin_version = "0.5"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_config_prefix = "diskcleaner_"
@@ -52,6 +52,8 @@ class DiskCleaner(_PluginBase):
     _monitor_download = True
     _monitor_library = True
     _monitor_downloader = False
+    _trigger_logic = "or"  # or/and
+    _strategy_quota = 1
 
     # 阈值配置
     _download_threshold_mode = "size"  # size/percent
@@ -82,9 +84,14 @@ class DiskCleaner(_PluginBase):
     # 媒体库刷新
     _refresh_mediaserver = False
     _refresh_mode = "item"  # item/root
+    _refresh_batch_size = 20
     _refresh_servers: List[str] = []
     _prefer_playback_history = True
     _library_probe_limit = 30
+    _enable_retry_queue = True
+    _retry_max_attempts = 3
+    _retry_interval_minutes = 30
+    _retry_batch_size = 5
 
     # 数据操作
     _transfer_oper: Optional[TransferHistoryOper] = None
@@ -113,6 +120,8 @@ class DiskCleaner(_PluginBase):
             self._monitor_download = bool(config.get("monitor_download", True))
             self._monitor_library = bool(config.get("monitor_library", True))
             self._monitor_downloader = bool(config.get("monitor_downloader", False))
+            self._trigger_logic = config.get("trigger_logic") or "or"
+            self._strategy_quota = int(self._safe_float(config.get("strategy_quota"), 1))
 
             self._download_threshold_mode = config.get("download_threshold_mode") or "size"
             self._download_threshold_value = self._safe_float(config.get("download_threshold_value"), 100.0)
@@ -138,9 +147,14 @@ class DiskCleaner(_PluginBase):
 
             self._refresh_mediaserver = bool(config.get("refresh_mediaserver", False))
             self._refresh_mode = config.get("refresh_mode") or "item"
+            self._refresh_batch_size = int(self._safe_float(config.get("refresh_batch_size"), 20))
             self._refresh_servers = config.get("refresh_servers") or []
             self._prefer_playback_history = bool(config.get("prefer_playback_history", True))
             self._library_probe_limit = int(self._safe_float(config.get("library_probe_limit"), 30))
+            self._enable_retry_queue = bool(config.get("enable_retry_queue", True))
+            self._retry_max_attempts = int(self._safe_float(config.get("retry_max_attempts"), 3))
+            self._retry_interval_minutes = int(self._safe_float(config.get("retry_interval_minutes"), 30))
+            self._retry_batch_size = int(self._safe_float(config.get("retry_batch_size"), 5))
 
         self._normalize_config()
 
@@ -219,6 +233,42 @@ class DiskCleaner(_PluginBase):
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VSwitch", "props": {"model": "dry_run", "label": "演练模式(不执行删除)"}}],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "trigger_logic",
+                                            "label": "阈值触发逻辑",
+                                            "items": [
+                                                {"title": "OR（任一阈值命中）", "value": "or"},
+                                                {"title": "AND（全部阈值命中）", "value": "and"},
+                                            ],
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "strategy_quota",
+                                            "label": "同轮单策略配额",
+                                            "placeholder": "每个策略单轮最多处理条目数",
+                                        },
+                                    }
+                                ],
                             },
                         ],
                     },
@@ -528,6 +578,72 @@ class DiskCleaner(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "refresh_batch_size",
+                                            "label": "刷新批次大小",
+                                            "placeholder": "单次定向刷新条目数",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{"component": "VSwitch", "props": {"model": "enable_retry_queue", "label": "启用失败补偿重试"}}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "retry_max_attempts",
+                                            "label": "最大重试次数",
+                                            "placeholder": "建议 2-5",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "retry_interval_minutes",
+                                            "label": "重试间隔(分钟)",
+                                            "placeholder": "建议 15-120",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "retry_batch_size",
+                                            "label": "单轮补偿处理数",
+                                            "placeholder": "建议 1-10",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -613,6 +729,8 @@ class DiskCleaner(_PluginBase):
             "monitor_download": True,
             "monitor_library": True,
             "monitor_downloader": False,
+            "trigger_logic": "or",
+            "strategy_quota": 1,
             "download_threshold_mode": "size",
             "download_threshold_value": 100,
             "library_threshold_mode": "size",
@@ -636,7 +754,12 @@ class DiskCleaner(_PluginBase):
             "path_blocklist": "",
             "refresh_mediaserver": False,
             "refresh_mode": "item",
+            "refresh_batch_size": 20,
             "refresh_servers": [],
+            "enable_retry_queue": True,
+            "retry_max_attempts": 3,
+            "retry_interval_minutes": 30,
+            "retry_batch_size": 5,
         }
 
     def get_page(self) -> List[dict]:
@@ -695,9 +818,11 @@ class DiskCleaner(_PluginBase):
                 "component": "VCard",
                 "content": [
                     {"component": "VCardText", "text": f"运行模式：{'演练模式' if self._dry_run else '实际删除'}"},
+                    {"component": "VCardText", "text": f"阈值逻辑：{self._trigger_logic.upper()} / 单策略配额：{self._strategy_quota}"},
                     {"component": "VCardText", "text": f"冷却时间：{self._cooldown_minutes} 分钟"},
                     {"component": "VCardText", "text": f"单轮上限：{self._max_delete_items} 条 / {self._max_gb_per_run} GB"},
                     {"component": "VCardText", "text": f"当日已释放：{self._format_size(self._get_daily_freed_bytes())} / {self._max_gb_per_day} GB"},
+                    {"component": "VCardText", "text": f"失败补偿队列：{self._retry_queue_size()} 条"},
                 ],
             },
             {
@@ -732,63 +857,82 @@ class DiskCleaner(_PluginBase):
             self._transfer_oper = TransferHistoryOper()
         if not self._download_oper:
             self._download_oper = DownloadHistoryOper()
+        if not self._mediaserver_oper:
+            self._mediaserver_oper = MediaServerOper()
 
         with self._lock:
             try:
                 logger.info(f"{self.plugin_name}开始执行")
                 self._current_run_freed_bytes = 0
                 self._playback_ts_cache = {}
+                retry_actions: List[dict] = []
+                skip_normal_cleanup = False
+                if self._enable_retry_queue and not self._dry_run:
+                    retry_actions = self._process_retry_queue(limit=self._retry_batch_size)
+
                 if self._is_in_cooldown():
-                    logger.info(f"{self.plugin_name}命中冷却时间，跳过执行")
-                    return
+                    if not retry_actions:
+                        logger.info(f"{self.plugin_name}命中冷却时间，跳过执行")
+                        return
+                    logger.info(f"{self.plugin_name}命中冷却时间，仅执行失败补偿")
+                    skip_normal_cleanup = True
 
                 if not self._dry_run and self._is_daily_limit_reached():
-                    logger.warning(f"{self.plugin_name}已达当日释放上限，跳过执行")
-                    return
+                    if not retry_actions:
+                        logger.warning(f"{self.plugin_name}已达当日释放上限，跳过执行")
+                        return
+                    logger.warning(f"{self.plugin_name}已达当日释放上限，仅执行失败补偿")
+                    skip_normal_cleanup = True
 
                 usage = self._collect_monitor_usage()
                 self.save_data("latest_usage", usage)
 
-                actions: List[dict] = []
+                round_actions: List[dict] = []
+                if not skip_normal_cleanup:
+                    strategy_plan = self._resolve_strategy_plan(usage)
+                    if strategy_plan:
+                        logger.info(f"{self.plugin_name}本轮触发策略：{','.join(strategy_plan)}")
+                    for strategy in strategy_plan:
+                        remaining = self._remaining_round_quota(round_actions)
+                        if remaining <= 0:
+                            break
+                        quota = min(self._strategy_quota, remaining)
+                        if quota <= 0:
+                            continue
 
-                # 单轮仅执行一类清理策略，避免叠加超量清理
-                if self._monitor_library and self._is_threshold_hit(
-                    usage.get("library", {}), self._library_threshold_mode, self._library_threshold_value
-                ):
-                    logger.info(f"{self.plugin_name}媒体库阈值已触发")
-                    actions = self._clean_by_library_threshold()
+                        if strategy == "library":
+                            actions = self._clean_by_library_threshold(quota=quota)
+                        elif strategy == "download":
+                            actions = self._clean_by_download_threshold(quota=quota)
+                        elif strategy == "downloader":
+                            actions = self._clean_by_downloader_seeding(quota=quota)
+                        else:
+                            actions = []
+                        round_actions.extend(actions)
 
-                if not actions and self._monitor_download and self._is_threshold_hit(
-                    usage.get("download", {}), self._download_threshold_mode, self._download_threshold_value
-                ):
-                    logger.info(f"{self.plugin_name}资源目录阈值已触发")
-                    actions = self._clean_by_download_threshold()
-
-                if not actions and self._monitor_downloader:
-                    actions = self._clean_by_downloader_seeding()
-
-                if not actions:
+                all_actions = retry_actions + round_actions
+                if not all_actions:
                     logger.info(f"{self.plugin_name}本次无需清理")
                     self.save_data("last_run_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     return
 
                 history = self.get_data("history") or []
-                history.extend(actions)
+                history.extend(all_actions)
                 self.save_data("history", history[-200:])
 
-                freed_bytes = sum(int(item.get("freed_bytes", 0) or 0) for item in actions)
+                freed_bytes = sum(int(item.get("freed_bytes", 0) or 0) for item in all_actions)
                 if not self._dry_run and freed_bytes > 0:
                     self._update_daily_freed_bytes(freed_bytes)
 
                 if self._refresh_mediaserver:
-                    refresh_items = self._collect_refresh_items(actions)
+                    refresh_items = self._collect_refresh_items(all_actions)
                     refreshed = self._refresh_media_servers(refresh_items=refresh_items)
                     if refreshed > 0:
                         logger.info(f"{self.plugin_name}已触发 {refreshed} 个媒体服务器刷新")
 
                 if self._notify:
                     text = "\n".join(
-                        [f"{item.get('time')} | {item.get('trigger')} | {item.get('action')}" for item in actions[:20]]
+                        [f"{item.get('time')} | {item.get('trigger')} | {item.get('action')}" for item in all_actions[:20]]
                     )
                     mode_text = "演练模式" if self._dry_run else "实际删除"
                     self.post_message(
@@ -799,16 +943,52 @@ class DiskCleaner(_PluginBase):
 
                 self.save_data("last_run_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 logger.info(
-                    f"{self.plugin_name}执行完成，本次处理 {len(actions)} 条，"
+                    f"{self.plugin_name}执行完成，本次处理 {len(all_actions)} 条，"
                     f"{'预计' if self._dry_run else '实际'}释放 {self._format_size(freed_bytes)}"
                 )
             except Exception as err:
                 logger.error(f"{self.plugin_name}任务执行异常：{err}", exc_info=True)
 
-    def _clean_by_library_threshold(self) -> List[dict]:
+    def _resolve_strategy_plan(self, usage: dict) -> List[str]:
+        library_hit = self._monitor_library and self._is_threshold_hit(
+            usage.get("library", {}), self._library_threshold_mode, self._library_threshold_value
+        )
+        download_hit = self._monitor_download and self._is_threshold_hit(
+            usage.get("download", {}), self._download_threshold_mode, self._download_threshold_value
+        )
+
+        plan: List[str] = []
+        if self._trigger_logic == "and":
+            threshold_enabled = self._monitor_library or self._monitor_download
+            threshold_ok = threshold_enabled and \
+                (not self._monitor_library or library_hit) and \
+                (not self._monitor_download or download_hit)
+            if threshold_ok:
+                if self._monitor_library:
+                    plan.append("library")
+                if self._monitor_download:
+                    plan.append("download")
+        else:
+            if library_hit:
+                plan.append("library")
+            if download_hit:
+                plan.append("download")
+
+        if self._monitor_downloader:
+            plan.append("downloader")
+
+        return plan
+
+    def _remaining_round_quota(self, actions: List[dict]) -> int:
+        if self._max_delete_items <= 0:
+            return max(1, self._strategy_quota)
+        return max(0, self._max_delete_items - len(actions))
+
+    def _clean_by_library_threshold(self, quota: Optional[int] = None) -> List[dict]:
         actions: List[dict] = []
         skipped_paths = set()
-        for _ in range(self._max_delete_items):
+        strategy_quota = max(1, int(quota if quota is not None else self._max_delete_items))
+        for _ in range(strategy_quota):
             if self._is_run_limit_reached(actions):
                 break
             usage = self._collect_monitor_usage().get("library", {})
@@ -827,11 +1007,11 @@ class DiskCleaner(_PluginBase):
                 self._current_run_freed_bytes += int(result.get("freed_bytes", 0) or 0)
         return actions
 
-    def _clean_by_download_threshold(self) -> List[dict]:
+    def _clean_by_download_threshold(self, quota: Optional[int] = None) -> List[dict]:
         actions: List[dict] = []
         skipped_hashes = set()
-
-        for _ in range(self._max_delete_items):
+        strategy_quota = max(1, int(quota if quota is not None else self._max_delete_items))
+        for _ in range(strategy_quota):
             if self._is_run_limit_reached(actions):
                 break
             usage = self._collect_monitor_usage().get("download", {})
@@ -851,11 +1031,11 @@ class DiskCleaner(_PluginBase):
 
         return actions
 
-    def _clean_by_downloader_seeding(self) -> List[dict]:
+    def _clean_by_downloader_seeding(self, quota: Optional[int] = None) -> List[dict]:
         actions: List[dict] = []
         skipped_hashes = set()
-
-        for _ in range(self._max_delete_items):
+        strategy_quota = max(1, int(quota if quota is not None else self._max_delete_items))
+        for _ in range(strategy_quota):
             if self._is_run_limit_reached(actions):
                 break
             candidate = self._pick_longest_seeding_torrent(min_days=self._seeding_days, skipped_hashes=skipped_hashes)
@@ -941,6 +1121,28 @@ class DiskCleaner(_PluginBase):
             if self._clean_download_history and download_hash:
                 removed_download = self._delete_download_history(download_hash)
 
+        step_result = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        failed_steps = self._collect_failed_steps(step_result)
+        if failed_steps and not self._dry_run and self._enable_retry_queue:
+            self._enqueue_retry({
+                "mode": "media",
+                "retry_key": f"media:{media_path.as_posix()}:{download_hash or ''}",
+                "trigger": "媒体库阈值",
+                "target": media_path.as_posix(),
+                "media_path": media_path.as_posix(),
+                "sidecars": [item.as_posix() for item in sidecars],
+                "download_hash": download_hash,
+                "downloader": downloader,
+                "history_dest": getattr(history, "dest", None) if history else None,
+                "failed_steps": failed_steps,
+            })
+
         total_actions = removed_media + removed_scrape + removed_downloader + removed_transfer + removed_download
         if total_actions <= 0:
             return None
@@ -964,6 +1166,7 @@ class DiskCleaner(_PluginBase):
             "freed_bytes": freed_bytes,
             "mode": "dry-run" if self._dry_run else "apply",
             "refresh_items": refresh_items,
+            "steps": step_result,
         }
 
     def _cleanup_by_torrent(self, candidate: dict, trigger: str) -> Optional[dict]:
@@ -1055,6 +1258,28 @@ class DiskCleaner(_PluginBase):
             if self._clean_download_history:
                 removed_download = self._delete_download_history(download_hash)
 
+        step_result = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        failed_steps = self._collect_failed_steps(step_result)
+        if failed_steps and not self._dry_run and self._enable_retry_queue:
+            self._enqueue_retry({
+                "mode": "torrent",
+                "retry_key": f"torrent:{download_hash}",
+                "trigger": trigger,
+                "target": f"{downloader}:{name}",
+                "download_hash": download_hash,
+                "downloader": downloader,
+                "media_targets": [item.as_posix() for item in media_targets],
+                "sidecar_targets": [item.as_posix() for item in sidecar_targets],
+                "history_dests": [getattr(item, "dest", None) for item in histories if getattr(item, "dest", None)],
+                "failed_steps": failed_steps,
+            })
+
         total_actions = removed_media + removed_scrape + removed_downloader + removed_transfer + removed_download
         if total_actions <= 0:
             return None
@@ -1078,6 +1303,7 @@ class DiskCleaner(_PluginBase):
             "freed_bytes": freed_bytes,
             "mode": "dry-run" if self._dry_run else "apply",
             "refresh_items": refresh_items,
+            "steps": step_result,
         }
 
     def _pick_oldest_library_media(self, skipped_paths: Optional[set] = None) -> Optional[dict]:
@@ -1473,6 +1699,270 @@ class DiskCleaner(_PluginBase):
 
         return removed
 
+    @staticmethod
+    def _build_step_result(planned: int, done: int) -> dict:
+        planned_num = max(0, int(planned or 0))
+        done_num = max(0, int(done or 0))
+        return {
+            "planned": planned_num,
+            "done": done_num,
+            "failed": max(0, planned_num - done_num),
+        }
+
+    @staticmethod
+    def _collect_failed_steps(step_result: dict) -> List[str]:
+        return [
+            step for step, result in (step_result or {}).items()
+            if int((result or {}).get("failed", 0) or 0) > 0
+        ]
+
+    def _retry_queue_size(self) -> int:
+        return len(self.get_data("retry_queue") or [])
+
+    def _enqueue_retry(self, payload: dict):
+        if not payload or not payload.get("failed_steps"):
+            return
+        queue = self.get_data("retry_queue") or []
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        retry_key = payload.get("retry_key") or f"retry:{int(time.time() * 1000)}"
+        merged = False
+        for item in queue:
+            if item.get("retry_key") != retry_key:
+                continue
+            item_payload = item.get("payload") or {}
+            old_steps = set(item_payload.get("failed_steps") or [])
+            new_steps = set(payload.get("failed_steps") or [])
+            item_payload.update(payload)
+            item_payload["failed_steps"] = sorted(old_steps | new_steps)
+            item["payload"] = item_payload
+            item["next_run_at"] = now_text
+            merged = True
+            break
+        if not merged:
+            queue.append({
+                "id": f"{int(time.time() * 1000)}-{len(queue) + 1}",
+                "retry_key": retry_key,
+                "attempt": 0,
+                "created_at": now_text,
+                "next_run_at": now_text,
+                "payload": payload,
+            })
+        self.save_data("retry_queue", queue[-500:])
+
+    def _process_retry_queue(self, limit: int) -> List[dict]:
+        queue = self.get_data("retry_queue") or []
+        if not queue:
+            return []
+        now = datetime.now()
+        limit = max(1, int(limit or 1))
+        processed = 0
+        remain_queue = []
+        actions: List[dict] = []
+        for job in queue:
+            next_run_at = self._parse_datetime_text(job.get("next_run_at"))
+            if next_run_at and next_run_at > now:
+                remain_queue.append(job)
+                continue
+            if processed >= limit:
+                remain_queue.append(job)
+                continue
+            processed += 1
+            action, next_job = self._run_retry_job(job)
+            if action:
+                actions.append(action)
+            if next_job:
+                remain_queue.append(next_job)
+        self.save_data("retry_queue", remain_queue[-500:])
+        return actions
+
+    def _run_retry_job(self, job: dict) -> Tuple[Optional[dict], Optional[dict]]:
+        payload = job.get("payload") or {}
+        mode = payload.get("mode")
+        attempt = int(job.get("attempt", 0) or 0) + 1
+        if mode == "media":
+            result = self._retry_media_payload(payload)
+        elif mode == "torrent":
+            result = self._retry_torrent_payload(payload)
+        else:
+            return None, None
+
+        failed_steps = result.get("failed_steps") or []
+        ok = len(failed_steps) == 0
+        action = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": f"失败补偿:{payload.get('trigger') or '-'}",
+            "target": payload.get("target") or "-",
+            "action": f"重试{'成功' if ok else '失败'}(第{attempt}次)；失败步骤：{','.join(failed_steps) if failed_steps else '无'}",
+            "freed_bytes": int(result.get("freed_bytes", 0) or 0),
+            "mode": "retry",
+            "steps": result.get("steps") or {},
+            "refresh_items": result.get("refresh_items") or [],
+        }
+        if ok:
+            return action, None
+
+        if attempt >= self._retry_max_attempts:
+            dead = self.get_data("retry_deadletter") or []
+            dead.append({
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "job": job,
+                "last_failed_steps": failed_steps,
+            })
+            self.save_data("retry_deadletter", dead[-200:])
+            return action, None
+
+        retry_job = dict(job)
+        retry_payload = dict(payload)
+        retry_payload["failed_steps"] = failed_steps
+        retry_job["payload"] = retry_payload
+        retry_job["attempt"] = attempt
+        next_run = datetime.now() + timedelta(minutes=max(1, self._retry_interval_minutes) * attempt)
+        retry_job["next_run_at"] = next_run.strftime("%Y-%m-%d %H:%M:%S")
+        return action, retry_job
+
+    def _retry_media_payload(self, payload: dict) -> dict:
+        failed = set(payload.get("failed_steps") or [])
+        media_path = Path(payload.get("media_path")) if payload.get("media_path") else None
+        sidecars = [Path(item) for item in (payload.get("sidecars") or []) if item]
+        download_hash = payload.get("download_hash")
+        downloader = payload.get("downloader")
+        history_dest = payload.get("history_dest")
+        library_roots = self._library_paths()
+
+        freed_bytes = 0
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        planned_media = 1 if "media" in failed and media_path else 0
+        if planned_media and media_path:
+            freed_bytes += self._path_size(media_path)
+            if (not media_path.exists() and not media_path.is_symlink()) or self._delete_local_item(media_path, library_roots):
+                removed_media = 1
+
+        planned_scrape = len(sidecars) if "scrape" in failed else 0
+        if planned_scrape:
+            for sidecar in sidecars:
+                freed_bytes += self._path_size(sidecar)
+                if (not sidecar.exists() and not sidecar.is_symlink()) or self._delete_local_item(sidecar, library_roots):
+                    removed_scrape += 1
+
+        planned_downloader = 1 if "downloader" in failed and download_hash and downloader else 0
+        if planned_downloader and self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+            removed_downloader = 1
+
+        planned_transfer = 0
+        if "transfer_history" in failed:
+            history = self._transfer_oper.get_by_dest(history_dest) if history_dest and self._transfer_oper else None
+            planned_transfer = self._count_transfer_records(download_hash, history)
+            if planned_transfer > 0:
+                removed_transfer = self._delete_transfer_history(download_hash=download_hash, history=history)
+
+        planned_download = 0
+        if "download_history" in failed and download_hash:
+            planned_download = self._count_download_records(download_hash)
+            if planned_download > 0:
+                removed_download = self._delete_download_history(download_hash)
+
+        steps = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        refresh_items = []
+        history = self._transfer_oper.get_by_dest(history_dest) if history_dest and self._transfer_oper else None
+        if history:
+            refresh_item = self._build_refresh_item(history=history, target_path=history_dest)
+            if refresh_item:
+                refresh_items.append(refresh_item)
+        return {
+            "steps": steps,
+            "failed_steps": self._collect_failed_steps(steps),
+            "freed_bytes": freed_bytes,
+            "refresh_items": refresh_items,
+        }
+
+    def _retry_torrent_payload(self, payload: dict) -> dict:
+        failed = set(payload.get("failed_steps") or [])
+        download_hash = payload.get("download_hash")
+        downloader = payload.get("downloader")
+        media_targets = [Path(item) for item in (payload.get("media_targets") or []) if item]
+        sidecar_targets = [Path(item) for item in (payload.get("sidecar_targets") or []) if item]
+        history_dests = [item for item in (payload.get("history_dests") or []) if item]
+        library_roots = self._library_paths()
+
+        freed_bytes = 0
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        planned_media = len(media_targets) if "media" in failed else 0
+        if planned_media:
+            for path in media_targets:
+                freed_bytes += self._path_size(path)
+                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, library_roots):
+                    removed_media += 1
+
+        planned_scrape = len(sidecar_targets) if "scrape" in failed else 0
+        if planned_scrape:
+            for path in sidecar_targets:
+                freed_bytes += self._path_size(path)
+                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, library_roots):
+                    removed_scrape += 1
+
+        planned_downloader = 1 if "downloader" in failed and downloader and download_hash else 0
+        if planned_downloader and self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+            removed_downloader = 1
+
+        planned_transfer = 0
+        if "transfer_history" in failed:
+            planned_transfer = self._count_transfer_records(download_hash, None)
+            if planned_transfer > 0:
+                removed_transfer = self._delete_transfer_history(download_hash=download_hash, history=None)
+
+        planned_download = 0
+        if "download_history" in failed and download_hash:
+            planned_download = self._count_download_records(download_hash)
+            if planned_download > 0:
+                removed_download = self._delete_download_history(download_hash)
+
+        steps = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        refresh_items = []
+        for dest in history_dests:
+            history = self._transfer_oper.get_by_dest(dest) if self._transfer_oper else None
+            if not history:
+                continue
+            refresh_item = self._build_refresh_item(history=history, target_path=dest)
+            if refresh_item:
+                refresh_items.append(refresh_item)
+        return {
+            "steps": steps,
+            "failed_steps": self._collect_failed_steps(steps),
+            "freed_bytes": freed_bytes,
+            "refresh_items": refresh_items,
+        }
+
+    @staticmethod
+    def _parse_datetime_text(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
     def _collect_refresh_items(self, actions: List[dict]) -> List[RefreshMediaItem]:
         if not actions:
             return []
@@ -1489,11 +1979,13 @@ class DiskCleaner(_PluginBase):
                         continue
                 else:
                     continue
+                key_path = Path(refresh_item.target_path) if refresh_item.target_path else None
+                group_key = key_path.parent.as_posix() if key_path and key_path.suffix else (key_path.as_posix() if key_path else "")
                 key = "|".join([
                     str(refresh_item.title or ""),
                     str(refresh_item.year or ""),
                     str(refresh_item.type or ""),
-                    str(refresh_item.target_path or ""),
+                    group_key,
                 ])
                 dedup[key] = refresh_item
         return list(dedup.values())
@@ -1526,6 +2018,7 @@ class DiskCleaner(_PluginBase):
             name_filters=self._refresh_servers if self._refresh_servers else None
         )
         refreshed = 0
+        refresh_items = refresh_items or []
         for server_name, service in services.items():
             instance = service.instance
             if not instance or not hasattr(instance, "refresh_root_library"):
@@ -1533,9 +2026,18 @@ class DiskCleaner(_PluginBase):
             try:
                 state = None
                 if self._refresh_mode == "item" and refresh_items and hasattr(instance, "refresh_library_by_items"):
-                    state = instance.refresh_library_by_items(refresh_items)
-                    if state is False and hasattr(instance, "refresh_root_library"):
+                    batch_failed = False
+                    for i in range(0, len(refresh_items), max(1, self._refresh_batch_size)):
+                        batch = refresh_items[i:i + max(1, self._refresh_batch_size)]
+                        batch_state = instance.refresh_library_by_items(batch)
+                        if batch_state is False:
+                            batch_failed = True
+                            logger.warning(f"{self.plugin_name}定向刷新失败，准备回退整库刷新：{server_name}")
+                            break
+                    if batch_failed and hasattr(instance, "refresh_root_library"):
                         state = instance.refresh_root_library()
+                    else:
+                        state = True
                 else:
                     state = instance.refresh_root_library()
                 if state is not False:
@@ -1723,8 +2225,7 @@ class DiskCleaner(_PluginBase):
         if self._max_delete_items > 0 and len(actions) >= self._max_delete_items:
             return True
         if self._max_gb_per_run > 0:
-            current_bytes = sum(int(item.get("freed_bytes", 0) or 0) for item in actions)
-            return current_bytes >= int(self._max_gb_per_run * (1024 ** 3))
+            return int(self._current_run_freed_bytes) >= int(self._max_gb_per_run * (1024 ** 3))
         return False
 
     def _effective_allow_roots(self, fallback_roots: List[Path]) -> List[Path]:
@@ -1763,6 +2264,8 @@ class DiskCleaner(_PluginBase):
             self._download_threshold_mode = "size"
         if self._library_threshold_mode not in ("size", "percent"):
             self._library_threshold_mode = "size"
+        if self._trigger_logic not in ("or", "and"):
+            self._trigger_logic = "or"
 
         self._download_threshold_value = max(0.0, self._safe_float(self._download_threshold_value, 100.0))
         self._library_threshold_value = max(0.0, self._safe_float(self._library_threshold_value, 100.0))
@@ -1774,11 +2277,16 @@ class DiskCleaner(_PluginBase):
         self._cooldown_minutes = max(0, int(self._cooldown_minutes))
         self._seeding_days = max(0, int(self._seeding_days))
         self._max_delete_items = max(1, min(50, int(self._max_delete_items)))
+        self._strategy_quota = max(1, min(50, int(self._strategy_quota)))
         self._max_gb_per_run = max(0.0, self._safe_float(self._max_gb_per_run, 50.0))
         self._max_gb_per_day = max(0.0, self._safe_float(self._max_gb_per_day, 200.0))
         self._protect_recent_days = max(0, int(self._protect_recent_days))
         self._library_probe_limit = max(1, min(200, int(self._library_probe_limit)))
         self._refresh_mode = "item" if self._refresh_mode not in ("item", "root") else self._refresh_mode
+        self._refresh_batch_size = max(1, min(200, int(self._refresh_batch_size)))
+        self._retry_max_attempts = max(1, min(20, int(self._retry_max_attempts)))
+        self._retry_interval_minutes = max(1, min(1440, int(self._retry_interval_minutes)))
+        self._retry_batch_size = max(1, min(50, int(self._retry_batch_size)))
         self._downloaders = [str(item).strip() for item in (self._downloaders or []) if str(item).strip()]
         self._refresh_servers = [str(item).strip() for item in (self._refresh_servers or []) if str(item).strip()]
         self._path_allowlist = self._parse_path_list(self._path_allowlist)
@@ -1796,6 +2304,8 @@ class DiskCleaner(_PluginBase):
                 "monitor_download": self._monitor_download,
                 "monitor_library": self._monitor_library,
                 "monitor_downloader": self._monitor_downloader,
+                "trigger_logic": self._trigger_logic,
+                "strategy_quota": self._strategy_quota,
                 "download_threshold_mode": self._download_threshold_mode,
                 "download_threshold_value": self._download_threshold_value,
                 "library_threshold_mode": self._library_threshold_mode,
@@ -1819,6 +2329,11 @@ class DiskCleaner(_PluginBase):
                 "path_blocklist": "\n".join(self._path_blocklist),
                 "refresh_mediaserver": self._refresh_mediaserver,
                 "refresh_mode": self._refresh_mode,
+                "refresh_batch_size": self._refresh_batch_size,
                 "refresh_servers": self._refresh_servers,
+                "enable_retry_queue": self._enable_retry_queue,
+                "retry_max_attempts": self._retry_max_attempts,
+                "retry_interval_minutes": self._retry_interval_minutes,
+                "retry_batch_size": self._retry_batch_size,
             }
         )
