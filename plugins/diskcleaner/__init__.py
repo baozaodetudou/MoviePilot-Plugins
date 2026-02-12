@@ -26,7 +26,7 @@ class DiskCleaner(_PluginBase):
     # 插件信息
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
+    plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
     plugin_version = "0.2"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
