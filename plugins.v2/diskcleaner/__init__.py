@@ -32,7 +32,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.12"
+    plugin_version = "0.15"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_config_prefix = "diskcleaner_"
@@ -66,6 +66,7 @@ class DiskCleaner(_PluginBase):
     # 下载器策略
     _downloaders: List[str] = []
     _seeding_days = 15
+    _media_flow_seed_check = True
     _max_delete_items = 5
     _max_gb_per_run = 50.0
     _max_gb_per_day = 200.0
@@ -76,11 +77,11 @@ class DiskCleaner(_PluginBase):
     # 删除开关
     _clean_media_data = True
     _clean_scrape_data = True
-    _clean_downloader_seed = True
+    _clean_downloader_seed = False
     _delete_downloader_files = False
+    _force_hardlink_cleanup = False
     _clean_transfer_history = True
     _clean_download_history = True
-    _mp_only = True
     _path_allowlist: List[str] = []
     _path_blocklist: List[str] = []
     _media_path_mapping: List[str] = []
@@ -134,12 +135,19 @@ class DiskCleaner(_PluginBase):
             self._trigger_flow = config.get("trigger_flow") or "flow_library_mp_downloader"
 
             self._download_threshold_mode = config.get("download_threshold_mode") or "size"
-            self._download_threshold_value = self._safe_float(config.get("download_threshold_value"), 100.0)
+            self._download_threshold_value = self._parse_threshold_value(
+                config.get("download_threshold_value"),
+                self._download_threshold_mode,
+            )
             self._library_threshold_mode = config.get("library_threshold_mode") or "size"
-            self._library_threshold_value = self._safe_float(config.get("library_threshold_value"), 100.0)
+            self._library_threshold_value = self._parse_threshold_value(
+                config.get("library_threshold_value"),
+                self._library_threshold_mode,
+            )
 
             self._downloaders = config.get("downloaders") or []
             self._seeding_days = int(self._safe_float(config.get("seeding_days"), 15))
+            self._media_flow_seed_check = bool(config.get("media_flow_seed_check", True))
             self._max_delete_items = max(1, int(self._safe_float(config.get("max_delete_items"), 5)))
             self._max_gb_per_run = self._safe_float(config.get("max_gb_per_run"), 50.0)
             self._max_gb_per_day = self._safe_float(config.get("max_gb_per_day"), 200.0)
@@ -149,11 +157,11 @@ class DiskCleaner(_PluginBase):
 
             self._clean_media_data = bool(config.get("clean_media_data", True))
             self._clean_scrape_data = bool(config.get("clean_scrape_data", True))
-            self._clean_downloader_seed = bool(config.get("clean_downloader_seed", True))
+            self._clean_downloader_seed = bool(config.get("clean_downloader_seed", False))
             self._delete_downloader_files = bool(config.get("delete_downloader_files", False))
+            self._force_hardlink_cleanup = bool(config.get("force_hardlink_cleanup", False))
             self._clean_transfer_history = bool(config.get("clean_transfer_history", True))
             self._clean_download_history = bool(config.get("clean_download_history", True))
-            self._mp_only = bool(config.get("mp_only", True))
             self._path_allowlist = self._parse_path_list(config.get("path_allowlist"))
             self._path_blocklist = self._parse_path_list(config.get("path_blocklist"))
             self._media_path_mapping = self._parse_path_list(config.get("media_path_mapping"))
@@ -170,6 +178,22 @@ class DiskCleaner(_PluginBase):
             self._retry_batch_size = int(self._safe_float(config.get("retry_batch_size"), 5))
 
         self._normalize_config()
+        if config:
+            normalized_download_text = self._format_threshold_value(
+                self._download_threshold_value,
+                self._download_threshold_mode,
+            )
+            normalized_library_text = self._format_threshold_value(
+                self._library_threshold_value,
+                self._library_threshold_mode,
+            )
+            if (
+                str(config.get("download_threshold_value", "") or "").strip() != normalized_download_text
+                or str(config.get("library_threshold_value", "") or "").strip() != normalized_library_text
+                or "media_flow_seed_check" not in config
+                or "force_hardlink_cleanup" not in config
+            ):
+                self.__update_config()
 
         if self._clear_history:
             for key in ["history", "run_history", "last_run_at", "daily_freed", "latest_usage", "retry_deadletter"]:
@@ -240,6 +264,11 @@ class DiskCleaner(_PluginBase):
         ]
         media_library_items = self._media_library_items(server_filters=self._effective_media_servers())
         risk_notice_acked = bool(self.get_data("risk_notice_acked"))
+        risk_notice_shown_once = bool(self.get_data("risk_notice_shown_once"))
+        show_risk_notice = not risk_notice_acked and not risk_notice_shown_once
+        if show_risk_notice:
+            # 兜底：首次进入配置页后不再重复弹窗，避免前端事件异常导致反复提示
+            self.save_data("risk_notice_shown_once", True)
         risk_notice_ack_api = f"/api/v1/plugin/{self.__class__.__name__}/ack_risk_notice?apikey={settings.API_TOKEN}"
         delete_module = [
             {
@@ -267,13 +296,13 @@ class DiskCleaner(_PluginBase):
             {
                 "component": "VRow",
                 "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_library", "label": "监听媒体目录阈值"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_library", "label": "启用媒体库空间告警"}}]},
                     {
                         "component": "VCol",
                         "props": {"cols": 12, "md": 4},
-                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "library_threshold_mode", "label": "媒体库阈值类型", "items": [{"title": "剩余固定值(GB)", "value": "size"}, {"title": "剩余百分比(%)", "value": "percent"}]}}],
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "library_threshold_mode", "label": "媒体库告警方式", "items": [{"title": "按剩余容量（如 100G）", "value": "size"}, {"title": "按剩余比例（如 10%）", "value": "percent"}]}}],
                     },
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "library_threshold_value", "label": "媒体库触发阈值"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "library_threshold_value", "label": "媒体库告警阈值", "placeholder": "支持 100G 或 10%"}}]},
                     {
                         "component": "VCol",
                         "props": {"cols": 12, "md": 6},
@@ -342,6 +371,7 @@ class DiskCleaner(_PluginBase):
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-2"},
                 "content": [
+                    {"component": "div", "text": "阈值填写示例：按容量填 100G（默认）；按比例填 10%（建议）"},
                     {"component": "div", "text": "路径映射示例：Emby /data/A.mp4，MP /mnt/link/A.mp4"},
                     {"component": "div", "text": "映射填写：/data:/mnt/link；配置错误会导致无法命中MP整理记录"},
                     {"component": "div", "text": "媒体服务器与媒体库留空代表不过滤；选中后仅在选中范围内监听、删除和刷新"},
@@ -356,14 +386,14 @@ class DiskCleaner(_PluginBase):
                 "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_downloader_seed", "label": "删除做种"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "delete_downloader_files", "label": "同步删除文件"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "mp_only", "label": "仅MP任务"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_download", "label": "监听资源目录阈值"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "media_flow_seed_check", "label": "媒体流程删种校验做种时长"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_download", "label": "启用下载目录空间告警"}}]},
                     {
                         "component": "VCol",
                         "props": {"cols": 12, "md": 4},
-                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "download_threshold_mode", "label": "资源阈值类型", "items": [{"title": "剩余固定值(GB)", "value": "size"}, {"title": "剩余百分比(%)", "value": "percent"}]}}],
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "download_threshold_mode", "label": "下载目录告警方式", "items": [{"title": "按剩余容量（如 100G）", "value": "size"}, {"title": "按剩余比例（如 10%）", "value": "percent"}]}}],
                     },
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "download_threshold_value", "label": "资源触发阈值"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "download_threshold_value", "label": "下载目录告警阈值", "placeholder": "支持 100G 或 10%"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_downloader", "label": "监听下载器做种时长(独立触发)"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "seeding_days", "label": "做种时长阈值(天，按完成时间计算)"}}]},
                     {
@@ -371,6 +401,14 @@ class DiskCleaner(_PluginBase):
                         "props": {"cols": 12, "md": 4},
                         "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "chips": True, "multiple": True, "clearable": True, "model": "downloaders", "label": "下载器(多选)", "items": downloader_items}}],
                     },
+                ],
+            },
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-2"},
+                "content": [
+                    {"component": "div", "text": "阈值填写示例：按容量填 100G（默认）；按比例填 10%（建议）"},
+                    {"component": "div", "text": "做种时长按完成时间计算；仅在“监听下载器做种时长”开启时生效"},
                 ],
             },
         ]
@@ -400,7 +438,7 @@ class DiskCleaner(_PluginBase):
         ]
 
         warning_prefix = []
-        if not risk_notice_acked:
+        if show_risk_notice:
             warning_prefix = [
                 {
                     "component": "div",
@@ -523,6 +561,38 @@ class DiskCleaner(_PluginBase):
                         "component": "VCardText",
                         "content": [
                             {
+                                "component": "div",
+                                "props": {
+                                    "onVnodeMounted": (
+                                        "function(){ "
+                                        "if (window.__diskCleanerThresholdWatcher) { clearInterval(window.__diskCleanerThresholdWatcher); } "
+                                        "window.__diskCleanerPrevLibraryMode = (library_threshold_mode || 'size'); "
+                                        "window.__diskCleanerPrevDownloadMode = (download_threshold_mode || 'size'); "
+                                        "window.__diskCleanerThresholdWatcher = setInterval(function(){ "
+                                        "var lm = (library_threshold_mode || 'size'); "
+                                        "var dm = (download_threshold_mode || 'size'); "
+                                        "if (lm !== window.__diskCleanerPrevLibraryMode) { "
+                                        "library_threshold_value = (lm === 'percent') ? '10%' : '100G'; "
+                                        "window.__diskCleanerPrevLibraryMode = lm; "
+                                        "} "
+                                        "if (dm !== window.__diskCleanerPrevDownloadMode) { "
+                                        "download_threshold_value = (dm === 'percent') ? '10%' : '100G'; "
+                                        "window.__diskCleanerPrevDownloadMode = dm; "
+                                        "} "
+                                        "}, 300); "
+                                        "}"
+                                    ),
+                                    "onVnodeBeforeUnmount": (
+                                        "function(){ "
+                                        "if (window.__diskCleanerThresholdWatcher) { "
+                                        "clearInterval(window.__diskCleanerThresholdWatcher); "
+                                        "window.__diskCleanerThresholdWatcher = null; "
+                                        "} "
+                                        "}"
+                                    ),
+                                },
+                            },
+                            {
                                 "component": "VAlert",
                                 "props": {
                                     "type": "info",
@@ -548,7 +618,7 @@ class DiskCleaner(_PluginBase):
                                                     "label": "触发流程（单选｜决定删除链路）",
                                                     "items": [
                                                         {
-                                                            "title": "1. 媒体优先（推荐）｜媒体目录阈值 -> MP整理记录 -> 下载器做种",
+                                                            "title": "1. 媒体优先（推荐）｜媒体目录阈值 -> 优先联动MP/下载器（缺失时仅删本地）",
                                                             "value": "flow_library_mp_downloader",
                                                         },
                                                         {
@@ -584,6 +654,7 @@ class DiskCleaner(_PluginBase):
                                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
                                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "onlyonce", "label": "立即运行"}}]},
                                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "force_hardlink_cleanup", "label": "硬链接强制删除(兜底)"}}]},
                                 ],
                             },
                             {
@@ -653,6 +724,7 @@ class DiskCleaner(_PluginBase):
             "onlyonce": False,
             "clear_history": False,
             "dry_run": True,
+            "force_hardlink_cleanup": False,
             "tab": "tab-delete",
             "cron": "0 */8 * * *",
             "cooldown_minutes": 60,
@@ -661,13 +733,14 @@ class DiskCleaner(_PluginBase):
             "monitor_library": True,
             "monitor_downloader": False,
             "download_threshold_mode": "size",
-            "download_threshold_value": 100,
+            "download_threshold_value": "100G",
             "library_threshold_mode": "size",
-            "library_threshold_value": 100,
+            "library_threshold_value": "100G",
             "media_servers": [],
             "media_libraries": [],
             "downloaders": [],
             "seeding_days": 15,
+            "media_flow_seed_check": True,
             "max_delete_items": 5,
             "max_gb_per_run": 50,
             "max_gb_per_day": 200,
@@ -676,11 +749,10 @@ class DiskCleaner(_PluginBase):
             "tv_complete_only": True,
             "clean_media_data": True,
             "clean_scrape_data": True,
-            "clean_downloader_seed": True,
+            "clean_downloader_seed": False,
             "delete_downloader_files": False,
             "clean_transfer_history": True,
             "clean_download_history": True,
-            "mp_only": True,
             "prefer_playback_history": True,
             "media_path_mapping": "",
             "path_allowlist": "",
@@ -1242,8 +1314,8 @@ class DiskCleaner(_PluginBase):
 
             result = self._cleanup_by_media_file(
                 candidate=candidate,
-                trigger="流程1:媒体目录→MP整理→下载器做种",
-                require_torrent_link=True,
+                trigger="流程1:媒体目录→优先联动MP整理与下载器",
+                require_torrent_link=False,
             )
             skipped_paths.add(candidate.get("path").as_posix())
             if result:
@@ -1379,7 +1451,7 @@ class DiskCleaner(_PluginBase):
 
     def _trigger_flow_label(self, flow: Optional[str] = None) -> str:
         mapping = {
-            "flow_library_mp_downloader": "1. 媒体优先（推荐）-> MP整理记录 -> 下载器做种",
+            "flow_library_mp_downloader": "1. 媒体优先（推荐）-> 优先联动MP整理/下载器（缺失时仅删本地）",
             "flow_downloader_mp_library": "2. 下载器优先 -> MP整理记录 -> 媒体数据",
             "flow_transfer_oldest": "3. 整理记录优先（旧到新）-> 媒体数据 + 下载器做种",
         }
@@ -1399,6 +1471,8 @@ class DiskCleaner(_PluginBase):
         media_path = self._resolve_local_media_path(dest)
         download_hash = getattr(history, "download_hash", None)
         downloader = getattr(history, "downloader", None)
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
         library_paths = self._library_paths()
         scope_enabled = bool(self._media_servers or self._media_libraries)
         if scope_enabled:
@@ -1410,7 +1484,12 @@ class DiskCleaner(_PluginBase):
 
         planned_media = 1 if self._clean_media_data and media_path and media_path.exists() else 0
         planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
-        planned_downloader = 1 if self._clean_downloader_seed and download_hash and downloader else 0
+        can_delete_seed = self._can_delete_torrent_in_media_flow(
+            downloader=downloader,
+            torrent_hash=download_hash,
+            target=media_path.as_posix(),
+        )
+        planned_downloader = 1 if can_delete_seed else 0
         planned_transfer = (
             1 if (self._clean_transfer_history and scope_enabled) else
             (self._count_transfer_records(download_hash, history) if self._clean_transfer_history else 0)
@@ -1454,7 +1533,7 @@ class DiskCleaner(_PluginBase):
                     if self._delete_local_item(sidecar, library_paths):
                         removed_scrape += 1
 
-            if self._clean_downloader_seed and download_hash and downloader:
+            if can_delete_seed and download_hash and downloader:
                 if self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
                     removed_downloader += 1
 
@@ -1526,9 +1605,6 @@ class DiskCleaner(_PluginBase):
 
         history = self._find_transfer_history_by_media_path(media_path)
         scope_enabled = bool(self._media_servers or self._media_libraries)
-        if self._mp_only and not history:
-            logger.info(f"{self.plugin_name}跳过非MP关联媒体：{media_path.as_posix()}")
-            return None
         if history and self._is_history_recent(history):
             logger.info(f"{self.plugin_name}命中近期保护，跳过：{media_path.as_posix()}")
             return None
@@ -1537,14 +1613,34 @@ class DiskCleaner(_PluginBase):
             return None
         download_hash = getattr(history, "download_hash", None) if history else None
         downloader = getattr(history, "downloader", None) if history else None
+        if self._clean_transfer_history and not history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过整理记录删除：{media_path.as_posix()}")
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{media_path.as_posix()}")
         if require_torrent_link and not (history and download_hash and downloader):
             logger.info(f"{self.plugin_name}流程要求MP与下载器均可关联，跳过：{media_path.as_posix()}")
             return None
 
         library_paths = self._library_paths()
+        delete_roots = self._media_delete_roots(library_paths)
         sidecars = self._collect_scrape_files(media_path) if self._clean_scrape_data else []
+        media_targets: List[Path] = []
+        if self._clean_media_data and media_path.exists():
+            media_targets.append(media_path)
+        # 兜底策略：当缺失MP关联时，按硬链接关系清理同inode文件（常见于下载目录与媒体库硬链接）。
+        if self._force_hardlink_cleanup and self._clean_media_data and not history:
+            siblings = self._collect_hardlink_siblings(media_path, roots=delete_roots)
+            if siblings:
+                logger.warning(
+                    f"{self.plugin_name}触发硬链接兜底删除，发现 {len(siblings)} 个关联文件：{media_path.as_posix()}"
+                )
+                media_targets.extend(siblings)
+        dedup_media_targets: Dict[str, Path] = {}
+        for item in media_targets:
+            dedup_media_targets[item.as_posix()] = item
+        media_targets = list(dedup_media_targets.values())
 
-        planned_media = 1 if self._clean_media_data and media_path.exists() else 0
+        planned_media = len(media_targets)
         planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
         planned_downloader = 1 if self._clean_downloader_seed and download_hash and downloader else 0
         planned_transfer = (
@@ -1554,8 +1650,8 @@ class DiskCleaner(_PluginBase):
         planned_download = self._count_download_records(download_hash) if self._clean_download_history and download_hash else 0
 
         freed_bytes = 0
-        if planned_media:
-            freed_bytes += self._path_size(media_path)
+        for target in media_targets:
+            freed_bytes += self._path_size(target)
         for sidecar in sidecars:
             freed_bytes += self._path_size(sidecar)
 
@@ -1582,12 +1678,13 @@ class DiskCleaner(_PluginBase):
             removed_transfer = planned_transfer
             removed_download = planned_download
         else:
-            if self._clean_media_data and self._delete_local_item(media_path, library_paths):
-                removed_media += 1
+            for target in media_targets:
+                if self._delete_local_item(target, delete_roots):
+                    removed_media += 1
 
             if self._clean_scrape_data:
                 for sidecar in sidecars:
-                    if self._delete_local_item(sidecar, library_paths):
+                    if self._delete_local_item(sidecar, delete_roots):
                         removed_scrape += 1
 
             if self._clean_downloader_seed and download_hash and downloader:
@@ -1618,6 +1715,7 @@ class DiskCleaner(_PluginBase):
                 "trigger": trigger,
                 "target": media_path.as_posix(),
                 "media_path": media_path.as_posix(),
+                "media_targets": [item.as_posix() for item in media_targets],
                 "sidecars": [item.as_posix() for item in sidecars],
                 "download_hash": download_hash,
                 "downloader": downloader,
@@ -1677,9 +1775,13 @@ class DiskCleaner(_PluginBase):
             if not histories:
                 logger.info(f"{self.plugin_name}下载器任务不在所选媒体库范围内，跳过：{downloader}:{name}")
                 return None
-        if (self._mp_only or require_mp_history) and not histories:
+        if require_mp_history and not histories:
             logger.info(f"{self.plugin_name}跳过非MP关联任务：{downloader}:{name}")
             return None
+        if self._clean_transfer_history and not histories:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过整理记录删除：{downloader}:{name}")
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{downloader}:{name}")
         if histories and any(self._is_history_recent(history) for history in histories):
             logger.info(f"{self.plugin_name}命中近期保护，跳过：{downloader}:{name}")
             return None
@@ -1818,7 +1920,7 @@ class DiskCleaner(_PluginBase):
         skipped_paths = skipped_paths or set()
         media_exts = {ext.lower() for ext in settings.RMT_MEDIAEXT}
         candidates: List[dict] = []
-        need_history = bool(self._transfer_oper and (self._mp_only or self._prefer_playback_history))
+        need_history = bool(self._transfer_oper and self._prefer_playback_history)
 
         for root in library_paths:
             if not root.exists():
@@ -1836,8 +1938,6 @@ class DiskCleaner(_PluginBase):
                     except Exception:
                         continue
                     history = self._find_transfer_history_by_media_path(path) if need_history else None
-                    if self._mp_only and not history:
-                        continue
                     if history and self._is_history_recent(history):
                         continue
                     if history and not self._is_tv_cleanup_allowed(history):
@@ -2033,7 +2133,6 @@ class DiskCleaner(_PluginBase):
             return None
 
         best = None
-        linked_cache: Dict[str, bool] = {}
         min_seconds = int(min_days * 86400) if min_days else 0
 
         for downloader_name, service in services.items():
@@ -2049,13 +2148,6 @@ class DiskCleaner(_PluginBase):
                 if not torrent_hash or torrent_hash in skipped_hashes:
                     continue
 
-                if self._mp_only:
-                    linked = linked_cache.get(torrent_hash)
-                    if linked is None:
-                        linked = self._has_mp_history(torrent_hash)
-                        linked_cache[torrent_hash] = linked
-                    if not linked:
-                        continue
 
                 seed_seconds = self._torrent_seed_seconds(torrent)
                 if seed_seconds < min_seconds:
@@ -2278,8 +2370,91 @@ class DiskCleaner(_PluginBase):
 
     def _threshold_text(self, mode: str, value: float) -> str:
         if mode == "percent":
-            return f"剩余 <= {value}%"
-        return f"剩余 <= {value}GB"
+            return f"剩余 <= {self._format_threshold_value(value, 'percent')}"
+        return f"剩余 <= {self._format_threshold_value(value, 'size')}"
+
+    @staticmethod
+    def _parse_threshold_value(raw_value: Any, mode: str) -> float:
+        default_value = 10.0 if mode == "percent" else 100.0
+        if raw_value is None or raw_value == "":
+            return default_value
+        if isinstance(raw_value, (int, float)):
+            return float(raw_value)
+
+        text = str(raw_value).strip().lower()
+        if not text:
+            return default_value
+
+        factor = 1.0
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        elif text.endswith("gb") or text.endswith("g"):
+            text = text.rstrip("b").rstrip("g").strip()
+        elif text.endswith("tb") or text.endswith("t"):
+            text = text.rstrip("b").rstrip("t").strip()
+            factor = 1024.0
+        elif text.endswith("mb") or text.endswith("m"):
+            text = text.rstrip("b").rstrip("m").strip()
+            factor = 1.0 / 1024.0
+
+        try:
+            value = float(text) * factor
+        except Exception:
+            return default_value
+        return value
+
+    @staticmethod
+    def _format_threshold_value(value: Any, mode: str) -> str:
+        try:
+            val = float(value)
+        except Exception:
+            val = 10.0 if mode == "percent" else 100.0
+        if mode == "percent":
+            if abs(val - int(val)) < 1e-9:
+                return f"{int(val)}%"
+            return f"{val:.1f}%"
+        if abs(val - int(val)) < 1e-9:
+            return f"{int(val)}G"
+        return f"{val:.1f}G"
+
+    def _media_delete_roots(self, library_roots: Optional[List[Path]] = None) -> List[Path]:
+        roots = list(library_roots or self._library_paths())
+        if self._force_hardlink_cleanup:
+            roots.extend(self._download_paths())
+        return self._unique_existing_paths(roots)
+
+    def _collect_hardlink_siblings(self, media_path: Path, roots: List[Path]) -> List[Path]:
+        try:
+            base = Path(media_path)
+            if not base.exists() or not base.is_file() or base.is_symlink():
+                return []
+            base_stat = base.stat()
+            if int(getattr(base_stat, "st_nlink", 1) or 1) <= 1:
+                return []
+        except Exception:
+            return []
+
+        siblings: Dict[str, Path] = {}
+        for root in roots or []:
+            try:
+                if not root.exists():
+                    continue
+            except Exception:
+                continue
+            for current_root, _, files in os.walk(root.as_posix()):
+                for filename in files:
+                    path = Path(current_root) / filename
+                    if path == base:
+                        continue
+                    try:
+                        if path.is_symlink() or not path.is_file():
+                            continue
+                        stat = path.stat()
+                    except Exception:
+                        continue
+                    if stat.st_ino == base_stat.st_ino and stat.st_dev == base_stat.st_dev:
+                        siblings[path.as_posix()] = path
+        return list(siblings.values())
 
     def _delete_local_item(self, path: Path, roots: List[Path]) -> bool:
         path = Path(path)
@@ -2377,6 +2552,50 @@ class DiskCleaner(_PluginBase):
             logger.error(f"{self.plugin_name}删除下载器任务失败 {downloader}:{torrent_hash} - {err}")
             return False
 
+    def _can_delete_torrent_in_media_flow(
+        self,
+        downloader: Optional[str],
+        torrent_hash: Optional[str],
+        target: str = "-",
+    ) -> bool:
+        if not self._clean_downloader_seed or not downloader or not torrent_hash:
+            return False
+        if not self._media_flow_seed_check:
+            return True
+        if self._seeding_days <= 0:
+            return True
+
+        service = DownloaderHelper().get_service(name=downloader)
+        if not service or not service.instance:
+            logger.warning(f"{self.plugin_name}媒体流程删种校验失败，下载器不可用，跳过删种：{target}")
+            return False
+
+        try:
+            torrents = service.instance.get_completed_torrents() or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}媒体流程读取下载器做种信息失败，跳过删种：{target} - {err}")
+            return False
+
+        seed_seconds = None
+        for torrent in torrents:
+            if self._torrent_hash(torrent) != torrent_hash:
+                continue
+            seed_seconds = self._torrent_seed_seconds(torrent)
+            break
+
+        if seed_seconds is None:
+            logger.warning(f"{self.plugin_name}媒体流程未找到种子做种信息，跳过删种：{target}")
+            return False
+
+        need_seconds = int(self._seeding_days * 86400)
+        if seed_seconds < need_seconds:
+            logger.info(
+                f"{self.plugin_name}媒体流程种子做种时长不足，跳过删种：{target} "
+                f"(当前{int(seed_seconds / 86400)}天 < 阈值{self._seeding_days}天)"
+            )
+            return False
+        return True
+
     def _delete_transfer_history(self, download_hash: Optional[str], history: Any) -> int:
         if not self._transfer_oper:
             return 0
@@ -2387,6 +2606,10 @@ class DiskCleaner(_PluginBase):
         elif history:
             records = [history]
 
+        if not records:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过")
+            return 0
+
         removed = 0
         visited = set()
         for record in records:
@@ -2394,28 +2617,54 @@ class DiskCleaner(_PluginBase):
             if not rid or rid in visited:
                 continue
             visited.add(rid)
-            self._transfer_oper.delete(rid)
-            removed += 1
+            try:
+                self._transfer_oper.delete(rid)
+                removed += 1
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}删除整理记录失败，已跳过 id={rid}: {err}")
 
         return removed
 
     def _delete_download_history(self, download_hash: str) -> int:
-        if not self._download_oper or not download_hash:
+        if not self._download_oper:
+            return 0
+        if not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过")
             return 0
 
         removed = 0
+        found_main = False
 
         while True:
-            history = self._download_oper.get_by_hash(download_hash)
+            try:
+                history = self._download_oper.get_by_hash(download_hash)
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}查询下载记录失败，已跳过 hash={download_hash}: {err}")
+                break
             if not history:
                 break
-            self._download_oper.delete_history(history.id)
-            removed += 1
+            found_main = True
+            try:
+                self._download_oper.delete_history(history.id)
+                removed += 1
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}删除下载记录失败，已跳过 id={history.id}: {err}")
 
-        files = self._download_oper.get_files_by_hash(download_hash)
+        try:
+            files = self._download_oper.get_files_by_hash(download_hash)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}查询下载文件记录失败，已跳过 hash={download_hash}: {err}")
+            files = []
+        found_files = bool(files)
         for fileinfo in files:
-            self._download_oper.delete_downloadfile(fileinfo.id)
-            removed += 1
+            try:
+                self._download_oper.delete_downloadfile(fileinfo.id)
+                removed += 1
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}删除下载文件记录失败，已跳过 id={fileinfo.id}: {err}")
+
+        if not found_main and not found_files:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过 hash={download_hash}")
 
         return removed
 
@@ -2543,11 +2792,15 @@ class DiskCleaner(_PluginBase):
     def _retry_media_payload(self, payload: dict) -> dict:
         failed = set(payload.get("failed_steps") or [])
         media_path = Path(payload.get("media_path")) if payload.get("media_path") else None
+        media_targets = [Path(item) for item in (payload.get("media_targets") or []) if item]
+        if not media_targets and media_path:
+            media_targets = [media_path]
         sidecars = [Path(item) for item in (payload.get("sidecars") or []) if item]
         download_hash = payload.get("download_hash")
         downloader = payload.get("downloader")
         history_dest = payload.get("history_dest")
         library_roots = self._library_paths()
+        delete_roots = self._media_delete_roots(library_roots)
 
         freed_bytes = 0
         removed_media = 0
@@ -2556,17 +2809,18 @@ class DiskCleaner(_PluginBase):
         removed_transfer = 0
         removed_download = 0
 
-        planned_media = 1 if "media" in failed and media_path else 0
-        if planned_media and media_path:
-            freed_bytes += self._path_size(media_path)
-            if (not media_path.exists() and not media_path.is_symlink()) or self._delete_local_item(media_path, library_roots):
-                removed_media = 1
+        planned_media = len(media_targets) if "media" in failed else 0
+        if planned_media:
+            for target in media_targets:
+                freed_bytes += self._path_size(target)
+                if (not target.exists() and not target.is_symlink()) or self._delete_local_item(target, delete_roots):
+                    removed_media += 1
 
         planned_scrape = len(sidecars) if "scrape" in failed else 0
         if planned_scrape:
             for sidecar in sidecars:
                 freed_bytes += self._path_size(sidecar)
-                if (not sidecar.exists() and not sidecar.is_symlink()) or self._delete_local_item(sidecar, library_roots):
+                if (not sidecar.exists() and not sidecar.is_symlink()) or self._delete_local_item(sidecar, delete_roots):
                     removed_scrape += 1
 
         planned_downloader = 1 if "downloader" in failed and download_hash and downloader else 0
@@ -2902,15 +3156,6 @@ class DiskCleaner(_PluginBase):
             ],
         }
 
-    def _has_mp_history(self, download_hash: str) -> bool:
-        if not download_hash:
-            return False
-        if self._transfer_oper and self._transfer_oper.list_by_hash(download_hash):
-            return True
-        if self._download_oper and self._download_oper.get_by_hash(download_hash):
-            return True
-        return False
-
     def _count_transfer_records(self, download_hash: Optional[str], history: Any) -> int:
         if not self._transfer_oper:
             return 0
@@ -3127,8 +3372,14 @@ class DiskCleaner(_PluginBase):
         if self._library_threshold_mode not in ("size", "percent"):
             self._library_threshold_mode = "size"
 
-        self._download_threshold_value = max(0.0, self._safe_float(self._download_threshold_value, 100.0))
-        self._library_threshold_value = max(0.0, self._safe_float(self._library_threshold_value, 100.0))
+        self._download_threshold_value = max(
+            0.0,
+            self._parse_threshold_value(self._download_threshold_value, self._download_threshold_mode),
+        )
+        self._library_threshold_value = max(
+            0.0,
+            self._parse_threshold_value(self._library_threshold_value, self._library_threshold_mode),
+        )
         if self._download_threshold_mode == "percent":
             self._download_threshold_value = min(100.0, self._download_threshold_value)
         if self._library_threshold_mode == "percent":
@@ -3142,6 +3393,8 @@ class DiskCleaner(_PluginBase):
         self._protect_recent_days = max(0, int(self._protect_recent_days))
         self._media_cleanup_priority = self._normalize_media_priority(self._media_cleanup_priority)
         self._tv_complete_only = bool(self._tv_complete_only)
+        self._media_flow_seed_check = bool(self._media_flow_seed_check)
+        self._force_hardlink_cleanup = bool(self._force_hardlink_cleanup)
         self._refresh_mode = "item" if self._refresh_mode not in ("item", "root") else self._refresh_mode
         self._refresh_batch_size = max(1, min(200, int(self._refresh_batch_size)))
         self._retry_max_attempts = max(1, min(20, int(self._retry_max_attempts)))
@@ -3173,6 +3426,7 @@ class DiskCleaner(_PluginBase):
                 "onlyonce": self._onlyonce,
                 "clear_history": self._clear_history,
                 "dry_run": self._dry_run,
+                "force_hardlink_cleanup": self._force_hardlink_cleanup,
                 "cron": self._cron,
                 "cooldown_minutes": self._cooldown_minutes,
                 "monitor_download": self._monitor_download,
@@ -3180,11 +3434,18 @@ class DiskCleaner(_PluginBase):
                 "monitor_downloader": self._monitor_downloader,
                 "trigger_flow": self._trigger_flow,
                 "download_threshold_mode": self._download_threshold_mode,
-                "download_threshold_value": self._download_threshold_value,
+                "download_threshold_value": self._format_threshold_value(
+                    self._download_threshold_value,
+                    self._download_threshold_mode,
+                ),
                 "library_threshold_mode": self._library_threshold_mode,
-                "library_threshold_value": self._library_threshold_value,
+                "library_threshold_value": self._format_threshold_value(
+                    self._library_threshold_value,
+                    self._library_threshold_mode,
+                ),
                 "downloaders": self._downloaders,
                 "seeding_days": self._seeding_days,
+                "media_flow_seed_check": self._media_flow_seed_check,
                 "max_delete_items": self._max_delete_items,
                 "max_gb_per_run": self._max_gb_per_run,
                 "max_gb_per_day": self._max_gb_per_day,
@@ -3198,7 +3459,6 @@ class DiskCleaner(_PluginBase):
                 "delete_downloader_files": self._delete_downloader_files,
                 "clean_transfer_history": self._clean_transfer_history,
                 "clean_download_history": self._clean_download_history,
-                "mp_only": self._mp_only,
                 "path_allowlist": "\n".join(self._path_allowlist),
                 "path_blocklist": "\n".join(self._path_blocklist),
                 "media_path_mapping": "\n".join(self._media_path_mapping),
