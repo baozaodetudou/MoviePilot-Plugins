@@ -1,6 +1,7 @@
 import enum
 import importlib.util
 import os
+import json
 import sys
 import tempfile
 import types
@@ -266,6 +267,13 @@ class DiskCleanerMockTest(unittest.TestCase):
         cleaner.save_data("risk_notice_acked", True)
         form_after_ack, _ = cleaner.get_form()
         self.assertNotIn("VDialog", list(_iter_components(form_after_ack)))
+
+    def test_form_contains_usage_doc_link(self):
+        cleaner = self._new_cleaner()
+        form, _ = cleaner.get_form()
+        payload = json.dumps(form, ensure_ascii=False)
+        self.assertIn("USAGE.md", payload)
+        self.assertIn("打开使用文档", payload)
 
     def test_cleanup_by_torrent_allow_non_mp_with_downloadfile_hardlink_fallback(self):
         cleaner = self._new_cleaner()

@@ -32,9 +32,10 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.15"
+    plugin_version = "0.16"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
+    plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
     plugin_config_prefix = "diskcleaner_"
     plugin_order = 28
     auth_level = 1
@@ -645,6 +646,31 @@ class DiskCleaner(_PluginBase):
                                     "text": "建议：常规场景选“媒体优先”；做种占用高选“下载器优先”；需要按历史最旧顺序清理选“整理记录优先”。",
                                     "class": "mt-2",
                                 },
+                            },
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "success",
+                                    "variant": "tonal",
+                                    "density": "compact",
+                                    "class": "mt-2",
+                                },
+                                "content": [
+                                    {"component": "div", "text": "使用文档（含三种模式流程图与判断关系）"},
+                                    {"component": "div", "props": {"class": "text-caption"}, "text": self.plugin_doc_url},
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
+                                            "class": "mt-2",
+                                            "size": "small",
+                                            "variant": "outlined",
+                                            "color": "primary",
+                                            "href": self.plugin_doc_url,
+                                            "target": "_blank",
+                                        },
+                                        "text": "打开使用文档",
+                                    },
+                                ],
                             },
                             {
                                 "component": "VRow",
