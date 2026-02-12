@@ -1,6 +1,8 @@
 import enum
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -264,6 +266,97 @@ class DiskCleanerMockTest(unittest.TestCase):
         cleaner.save_data("risk_notice_acked", True)
         form_after_ack, _ = cleaner.get_form()
         self.assertNotIn("VDialog", list(_iter_components(form_after_ack)))
+
+    def test_cleanup_by_torrent_allow_non_mp_with_downloadfile_hardlink_fallback(self):
+        cleaner = self._new_cleaner()
+        cleaner._dry_run = False
+        cleaner._clean_media_data = True
+        cleaner._clean_scrape_data = False
+        cleaner._clean_downloader_seed = False
+        cleaner._clean_transfer_history = False
+        cleaner._clean_download_history = False
+        cleaner._force_hardlink_cleanup = True
+        cleaner._transfer_oper = SimpleNamespace(list_by_hash=lambda _hash: [])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            library_root = root / "library"
+            download_root = root / "download"
+            library_root.mkdir()
+            download_root.mkdir()
+
+            library_file = library_root / "movie.mkv"
+            download_file = download_root / "movie.mkv"
+            library_file.write_bytes(b"movie-bytes")
+            os.link(library_file, download_file)
+
+            cleaner._library_paths = lambda: [library_root]
+            cleaner._download_paths = lambda: [download_root]
+            cleaner._download_oper = SimpleNamespace(
+                get_files_by_hash=lambda _hash: [
+                    SimpleNamespace(
+                        fullpath=download_file.as_posix(),
+                        savepath=download_root.as_posix(),
+                        filepath="movie.mkv",
+                    )
+                ]
+            )
+
+            result = cleaner._cleanup_by_torrent(
+                candidate={"hash": "h1", "downloader": "qb", "name": "movie"},
+                trigger="unit-test",
+                require_mp_history=False,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertFalse(library_file.exists())
+            self.assertFalse(download_file.exists())
+            self.assertEqual(((result.get("steps") or {}).get("media") or {}).get("done"), 2)
+
+    def test_retry_torrent_payload_uses_delete_roots_including_download_paths(self):
+        cleaner = self._new_cleaner()
+        cleaner._force_hardlink_cleanup = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            library_root = root / "library"
+            download_root = root / "download"
+            library_root.mkdir()
+            download_root.mkdir()
+
+            media_file = library_root / "sample.mkv"
+            sidecar_file = library_root / "sample.nfo"
+            media_file.write_bytes(b"a")
+            sidecar_file.write_text("nfo", encoding="utf-8")
+
+            cleaner._library_paths = lambda: [library_root]
+            cleaner._download_paths = lambda: [download_root]
+            cleaner._path_size = lambda _path: 1
+
+            delete_roots_args = []
+
+            def _fake_delete(path, roots):
+                delete_roots_args.append([Path(item).as_posix() for item in roots])
+                return True
+
+            cleaner._delete_local_item = _fake_delete
+
+            result = cleaner._retry_torrent_payload(
+                {
+                    "failed_steps": ["media", "scrape"],
+                    "download_hash": "h2",
+                    "downloader": "qb",
+                    "media_targets": [media_file.as_posix()],
+                    "sidecar_targets": [sidecar_file.as_posix()],
+                    "history_dests": [],
+                }
+            )
+
+            self.assertEqual(len(delete_roots_args), 2)
+            for roots in delete_roots_args:
+                self.assertIn(download_root.as_posix(), roots)
+            self.assertEqual(((result.get("steps") or {}).get("media") or {}).get("done"), 1)
+            self.assertEqual(((result.get("steps") or {}).get("scrape") or {}).get("done"), 1)
 
 
 if __name__ == "__main__":

@@ -1352,10 +1352,11 @@ class DiskCleaner(_PluginBase):
                 break
 
             trigger_text = "流程2:下载器→MP整理→媒体数据(目录阈值)" if download_hit else "流程2:下载器→MP整理→媒体数据(做种阈值)"
+            allow_non_mp_hardlink = self._force_hardlink_cleanup and self._clean_media_data
             result = self._cleanup_by_torrent(
                 candidate=candidate,
                 trigger=trigger_text,
-                require_mp_history=True,
+                require_mp_history=not allow_non_mp_hardlink,
             )
             skipped_hashes.add(candidate.get("hash"))
             if result:
@@ -1469,11 +1470,13 @@ class DiskCleaner(_PluginBase):
 
         dest = getattr(history, "dest", None)
         media_path = self._resolve_local_media_path(dest)
+        target_text = media_path.as_posix() if media_path else (str(dest) if dest else "-")
         download_hash = getattr(history, "download_hash", None)
         downloader = getattr(history, "downloader", None)
         if self._clean_download_history and not download_hash:
             logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
         library_paths = self._library_paths()
+        delete_roots = self._media_delete_roots(library_paths)
         scope_enabled = bool(self._media_servers or self._media_libraries)
         if scope_enabled:
             if not media_path or not self._is_path_in_roots(media_path, library_paths):
@@ -1481,13 +1484,22 @@ class DiskCleaner(_PluginBase):
                 return None
 
         sidecars = self._collect_scrape_files(media_path) if media_path and self._clean_scrape_data else []
+        media_targets: List[Path] = []
+        if self._clean_media_data and media_path and media_path.exists():
+            media_targets.append(media_path)
+        media_targets = self._expand_media_targets_with_hardlinks(
+            media_targets=media_targets,
+            roots=delete_roots,
+            context=target_text,
+            enabled=self._force_hardlink_cleanup and self._clean_media_data,
+        )
 
-        planned_media = 1 if self._clean_media_data and media_path and media_path.exists() else 0
+        planned_media = len(media_targets)
         planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
         can_delete_seed = self._can_delete_torrent_in_media_flow(
             downloader=downloader,
             torrent_hash=download_hash,
-            target=media_path.as_posix(),
+            target=target_text,
         )
         planned_downloader = 1 if can_delete_seed else 0
         planned_transfer = (
@@ -1497,8 +1509,8 @@ class DiskCleaner(_PluginBase):
         planned_download = self._count_download_records(download_hash) if self._clean_download_history and download_hash else 0
 
         freed_bytes = 0
-        if planned_media and media_path:
-            freed_bytes += self._path_size(media_path)
+        for target in media_targets:
+            freed_bytes += self._path_size(target)
         for sidecar in sidecars:
             freed_bytes += self._path_size(sidecar)
 
@@ -1525,12 +1537,13 @@ class DiskCleaner(_PluginBase):
             removed_transfer = planned_transfer
             removed_download = planned_download
         else:
-            if self._clean_media_data and media_path and self._delete_local_item(media_path, library_paths):
-                removed_media += 1
+            for target in media_targets:
+                if self._delete_local_item(target, delete_roots):
+                    removed_media += 1
 
             if self._clean_scrape_data:
                 for sidecar in sidecars:
-                    if self._delete_local_item(sidecar, library_paths):
+                    if self._delete_local_item(sidecar, delete_roots):
                         removed_scrape += 1
 
             if can_delete_seed and download_hash and downloader:
@@ -1561,6 +1574,7 @@ class DiskCleaner(_PluginBase):
                 "trigger": trigger,
                 "target": dest or "-",
                 "media_path": dest,
+                "media_targets": [item.as_posix() for item in media_targets],
                 "sidecars": [item.as_posix() for item in sidecars],
                 "download_hash": download_hash,
                 "downloader": downloader,
@@ -1629,16 +1643,19 @@ class DiskCleaner(_PluginBase):
             media_targets.append(media_path)
         # 兜底策略：当缺失MP关联时，按硬链接关系清理同inode文件（常见于下载目录与媒体库硬链接）。
         if self._force_hardlink_cleanup and self._clean_media_data and not history:
-            siblings = self._collect_hardlink_siblings(media_path, roots=delete_roots)
-            if siblings:
-                logger.warning(
-                    f"{self.plugin_name}触发硬链接兜底删除，发现 {len(siblings)} 个关联文件：{media_path.as_posix()}"
-                )
-                media_targets.extend(siblings)
-        dedup_media_targets: Dict[str, Path] = {}
-        for item in media_targets:
-            dedup_media_targets[item.as_posix()] = item
-        media_targets = list(dedup_media_targets.values())
+            media_targets = self._expand_media_targets_with_hardlinks(
+                media_targets=media_targets,
+                roots=delete_roots,
+                context=media_path.as_posix(),
+                enabled=True,
+            )
+        else:
+            media_targets = self._expand_media_targets_with_hardlinks(
+                media_targets=media_targets,
+                roots=delete_roots,
+                context=media_path.as_posix(),
+                enabled=False,
+            )
 
         planned_media = len(media_targets)
         planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
@@ -1765,6 +1782,8 @@ class DiskCleaner(_PluginBase):
         histories = self._transfer_oper.list_by_hash(download_hash) if self._transfer_oper else []
         scope_enabled = bool(self._media_servers or self._media_libraries)
         library_paths = self._library_paths()
+        delete_roots = self._media_delete_roots(library_paths)
+        download_file_targets = self._download_file_media_paths(download_hash) if self._clean_media_data else []
         if scope_enabled:
             scoped_histories = []
             for history in histories:
@@ -1772,7 +1791,8 @@ class DiskCleaner(_PluginBase):
                 if path and self._is_path_in_roots(path, library_paths):
                     scoped_histories.append(history)
             histories = scoped_histories
-            if not histories:
+            allow_non_mp_hardlink = self._force_hardlink_cleanup and self._clean_media_data
+            if not histories and not allow_non_mp_hardlink:
                 logger.info(f"{self.plugin_name}下载器任务不在所选媒体库范围内，跳过：{downloader}:{name}")
                 return None
         if require_mp_history and not histories:
@@ -1807,7 +1827,26 @@ class DiskCleaner(_PluginBase):
                     media_targets.append(path)
                 if self._clean_scrape_data:
                     sidecar_targets.extend([item for item in self._collect_scrape_files(path) if item.exists()])
+            for path in download_file_targets:
+                if path.as_posix() in handled_paths:
+                    continue
+                handled_paths.add(path.as_posix())
+                media_targets.append(path)
 
+        media_targets = self._expand_media_targets_with_hardlinks(
+            media_targets=media_targets,
+            roots=delete_roots,
+            context=f"{downloader}:{name}",
+            enabled=self._force_hardlink_cleanup and self._clean_media_data,
+        )
+        if scope_enabled and not histories and self._force_hardlink_cleanup and self._clean_media_data:
+            if not any(self._is_path_in_roots(item, library_paths) for item in media_targets):
+                logger.info(f"{self.plugin_name}下载器任务未匹配到媒体库范围，跳过：{downloader}:{name}")
+                return None
+
+        if self._clean_scrape_data and media_targets:
+            for media_target in media_targets:
+                sidecar_targets.extend([item for item in self._collect_scrape_files(media_target) if item.exists()])
         dedup_sidecars = {}
         for sidecar in sidecar_targets:
             dedup_sidecars[sidecar.as_posix()] = sidecar
@@ -1846,11 +1885,11 @@ class DiskCleaner(_PluginBase):
             removed_download = planned_download
         else:
             for path in media_targets:
-                if self._delete_local_item(path, library_paths):
+                if self._delete_local_item(path, delete_roots):
                     removed_media += 1
 
             for sidecar in sidecar_targets:
-                if self._delete_local_item(sidecar, library_paths):
+                if self._delete_local_item(sidecar, delete_roots):
                     removed_scrape += 1
 
             if self._clean_downloader_seed and downloader:
@@ -2456,6 +2495,77 @@ class DiskCleaner(_PluginBase):
                         siblings[path.as_posix()] = path
         return list(siblings.values())
 
+    def _expand_media_targets_with_hardlinks(
+        self,
+        media_targets: List[Path],
+        roots: List[Path],
+        context: str,
+        enabled: bool,
+    ) -> List[Path]:
+        dedup: Dict[str, Path] = {}
+        for item in media_targets or []:
+            if item:
+                dedup[item.as_posix()] = item
+        if not enabled or not dedup:
+            return list(dedup.values())
+
+        origin = list(dedup.values())
+        added_count = 0
+        for target in origin:
+            for sibling in self._collect_hardlink_siblings(target, roots=roots):
+                key = sibling.as_posix()
+                if key in dedup:
+                    continue
+                dedup[key] = sibling
+                added_count += 1
+        if added_count > 0:
+            logger.warning(f"{self.plugin_name}触发硬链接兜底删除，新增 {added_count} 个关联文件：{context}")
+        return list(dedup.values())
+
+    def _download_file_media_paths(self, download_hash: Optional[str]) -> List[Path]:
+        if not self._download_oper or not download_hash:
+            return []
+        try:
+            files = self._download_oper.get_files_by_hash(download_hash) or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}查询下载文件记录失败，跳过提取本地路径 hash={download_hash}: {err}")
+            return []
+
+        allowed_exts = {str(ext).strip().lower() for ext in (getattr(settings, "RMT_MEDIAEXT", []) or []) if str(ext).strip()}
+        targets: Dict[str, Path] = {}
+        for fileinfo in files:
+            for raw_path in self._download_file_path_candidates(fileinfo):
+                local_path = self._resolve_local_media_path(raw_path)
+                if not local_path:
+                    continue
+                try:
+                    if not local_path.exists() and not local_path.is_symlink():
+                        continue
+                    if not local_path.is_file() and not local_path.is_symlink():
+                        continue
+                except Exception:
+                    continue
+                if allowed_exts and local_path.suffix.lower() not in allowed_exts:
+                    continue
+                targets[local_path.as_posix()] = local_path
+        return list(targets.values())
+
+    @staticmethod
+    def _download_file_path_candidates(fileinfo: Any) -> List[str]:
+        candidates: List[str] = []
+        fullpath = str(getattr(fileinfo, "fullpath", "") or "").strip()
+        if fullpath:
+            candidates.append(fullpath)
+        savepath = str(getattr(fileinfo, "savepath", "") or "").strip()
+        filepath = str(getattr(fileinfo, "filepath", "") or "").strip()
+        if savepath and filepath:
+            candidates.append((Path(savepath) / filepath).as_posix())
+        elif filepath:
+            file_path_obj = Path(filepath)
+            if file_path_obj.is_absolute():
+                candidates.append(file_path_obj.as_posix())
+        return candidates
+
     def _delete_local_item(self, path: Path, roots: List[Path]) -> bool:
         path = Path(path)
         if not path.exists() and not path.is_symlink():
@@ -2868,6 +2978,7 @@ class DiskCleaner(_PluginBase):
         sidecar_targets = [Path(item) for item in (payload.get("sidecar_targets") or []) if item]
         history_dests = [item for item in (payload.get("history_dests") or []) if item]
         library_roots = self._library_paths()
+        delete_roots = self._media_delete_roots(library_roots)
 
         freed_bytes = 0
         removed_media = 0
@@ -2880,14 +2991,14 @@ class DiskCleaner(_PluginBase):
         if planned_media:
             for path in media_targets:
                 freed_bytes += self._path_size(path)
-                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, library_roots):
+                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, delete_roots):
                     removed_media += 1
 
         planned_scrape = len(sidecar_targets) if "scrape" in failed else 0
         if planned_scrape:
             for path in sidecar_targets:
                 freed_bytes += self._path_size(path)
-                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, library_roots):
+                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, delete_roots):
                     removed_scrape += 1
 
         planned_downloader = 1 if "downloader" in failed and downloader and download_hash else 0
