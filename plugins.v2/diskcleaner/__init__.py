@@ -16,7 +16,6 @@ from app.core.config import settings
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.mediaserver_oper import MediaServerOper
 from app.db.models.transferhistory import TransferHistory
-from app.db.subscribe_oper import SubscribeOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.directory import DirectoryHelper
 from app.helper.downloader import DownloaderHelper
@@ -24,6 +23,7 @@ from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType, RefreshMediaItem
+from app.schemas.types import MediaType
 from app.utils.system import SystemUtils
 
 
@@ -105,8 +105,8 @@ class DiskCleaner(_PluginBase):
     _download_oper: Optional[DownloadHistoryOper] = None
     _mediaserver_oper: Optional[MediaServerOper] = None
     _mediaserver_chain: Optional[MediaServerChain] = None
-    _subscribe_oper: Optional[SubscribeOper] = None
     _playback_ts_cache: Dict[str, int] = {}
+    _tv_end_state_cache: Dict[str, bool] = {}
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -115,8 +115,8 @@ class DiskCleaner(_PluginBase):
         self._download_oper = DownloadHistoryOper()
         self._mediaserver_oper = MediaServerOper()
         self._mediaserver_chain = None
-        self._subscribe_oper = SubscribeOper()
         self._playback_ts_cache = {}
+        self._tv_end_state_cache = {}
         self._library_scope_cache = None
 
         if config:
@@ -345,7 +345,7 @@ class DiskCleaner(_PluginBase):
                     {"component": "div", "text": "路径映射示例：Emby /data/A.mp4，MP /mnt/link/A.mp4"},
                     {"component": "div", "text": "映射填写：/data:/mnt/link；配置错误会导致无法命中MP整理记录"},
                     {"component": "div", "text": "媒体服务器与媒体库留空代表不过滤；选中后仅在选中范围内监听、删除和刷新"},
-                    {"component": "div", "text": "启用“仅清理已完结电视剧”后，仅对订阅且已完整入库（完成订阅）的电视剧执行清理"},
+                    {"component": "div", "text": "启用“仅清理已完结电视剧”后，仅清理 TMDB 状态为完结/取消的电视剧"},
                 ],
             },
         ]
@@ -1902,28 +1902,40 @@ class DiskCleaner(_PluginBase):
         if self._history_media_type_key(history) != "tv":
             return True
         try:
-            if not self._subscribe_oper:
-                self._subscribe_oper = SubscribeOper()
-            if not self._subscribe_oper:
-                return False
-            season = self._extract_season_number(getattr(history, "seasons", None))
             tmdbid = getattr(history, "tmdbid", None)
-            doubanid = getattr(history, "doubanid", None)
-            active_subscribe = None
-            if tmdbid:
-                active_subscribe = self._subscribe_oper.get_by(type="电视剧", season=season, tmdbid=tmdbid)
-            if not active_subscribe and doubanid:
-                active_subscribe = self._subscribe_oper.get_by(type="电视剧", season=season, doubanid=doubanid)
-            if active_subscribe:
-                lack_episode = int(getattr(active_subscribe, "lack_episode", 0) or 0)
-                return lack_episode <= 0
-            if tmdbid and self._subscribe_oper.exist_history(tmdbid=tmdbid, season=season):
-                return True
-            if doubanid and self._subscribe_oper.exist_history(doubanid=doubanid):
-                return True
-            return False
+            return self._is_tv_series_ended_by_tmdb(tmdbid)
         except Exception as err:
-            logger.warning(f"{self.plugin_name}检查电视剧订阅完结状态失败：{err}")
+            logger.warning(f"{self.plugin_name}检查电视剧完结状态失败：{err}")
+            return False
+
+    def _is_tv_series_ended_by_tmdb(self, tmdbid: Any) -> bool:
+        if not tmdbid:
+            return False
+        try:
+            tmdb_id = int(tmdbid)
+        except Exception:
+            return False
+        cache_key = str(tmdb_id)
+        cached = self._tv_end_state_cache.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+        try:
+            tmdb_info = self.chain.tmdb_info(tmdbid=tmdb_id, mtype=MediaType.TV) if self.chain else None
+            if not isinstance(tmdb_info, dict) or not tmdb_info:
+                self._tv_end_state_cache[cache_key] = False
+                return False
+            status_text = str(tmdb_info.get("status") or "").strip().lower()
+            ended_status = {"ended", "canceled", "cancelled", "已完结", "完结", "已取消", "取消"}
+            is_ended = False
+            if status_text:
+                is_ended = status_text in ended_status
+            elif tmdb_info.get("in_production") is False:
+                is_ended = True
+            self._tv_end_state_cache[cache_key] = bool(is_ended)
+            return bool(is_ended)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}查询TMDB电视剧状态失败 tmdbid={tmdb_id}: {err}")
+            self._tv_end_state_cache[cache_key] = False
             return False
 
     def _effective_access_ts(self, path: Optional[Path], history: Any, fallback_ts: Optional[float]) -> int:
