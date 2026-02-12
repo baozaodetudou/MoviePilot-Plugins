@@ -65,7 +65,11 @@ def _install_fake_modules() -> None:
     sys.modules["app.chain.mediaserver"] = chain_mediaserver_mod
 
     core_config_mod = types.ModuleType("app.core.config")
-    core_config_mod.settings = SimpleNamespace(TZ="Asia/Shanghai", API_TOKEN="unit_test_token")
+    core_config_mod.settings = SimpleNamespace(
+        TZ="Asia/Shanghai",
+        API_TOKEN="unit_test_token",
+        RMT_MEDIAEXT={".mkv", ".mp4", ".avi"},
+    )
     sys.modules["app.core.config"] = core_config_mod
 
     db_download_mod = types.ModuleType("app.db.downloadhistory_oper")
@@ -365,6 +369,202 @@ class DiskCleanerMockTest(unittest.TestCase):
                 self.assertIn(download_root.as_posix(), roots)
             self.assertEqual(((result.get("steps") or {}).get("media") or {}).get("done"), 1)
             self.assertEqual(((result.get("steps") or {}).get("scrape") or {}).get("done"), 1)
+
+    def test_clean_by_download_threshold_skip_when_no_trigger(self):
+        cleaner = self._new_cleaner()
+        cleaner._monitor_download = True
+        cleaner._monitor_downloader = False
+        cleaner._is_threshold_hit = lambda *args, **kwargs: False
+        cleaner._collect_monitor_usage = lambda: {"download": {}, "library": {}}
+        cleaner._pick_longest_seeding_torrent = lambda *args, **kwargs: {"hash": "unexpected"}
+
+        actions = cleaner._clean_by_download_threshold(usage={"download": {}, "library": {}})
+        self.assertEqual(actions, [])
+
+    def test_clean_by_download_threshold_require_mp_history_toggle(self):
+        cleaner = self._new_cleaner()
+        cleaner._monitor_download = True
+        cleaner._monitor_downloader = False
+        cleaner._clean_media_data = True
+        cleaner._collect_monitor_usage = lambda: {"download": {}, "library": {}}
+        cleaner._is_threshold_hit = lambda *args, **kwargs: True
+
+        calls = {"pick": 0, "require_flags": []}
+
+        def _pick(*args, **kwargs):
+            calls["pick"] += 1
+            return {"hash": "h1", "downloader": "qb", "name": "n1"} if calls["pick"] == 1 else None
+
+        def _cleanup(candidate, trigger, require_mp_history):
+            calls["require_flags"].append(require_mp_history)
+            return {"freed_bytes": 0}
+
+        cleaner._pick_longest_seeding_torrent = _pick
+        cleaner._cleanup_by_torrent = _cleanup
+
+        cleaner._force_hardlink_cleanup = False
+        cleaner._clean_by_download_threshold()
+        self.assertEqual(calls["require_flags"][-1], True)
+
+        calls["pick"] = 0
+        cleaner._force_hardlink_cleanup = True
+        cleaner._clean_by_download_threshold()
+        self.assertEqual(calls["require_flags"][-1], False)
+
+    def test_clean_by_download_threshold_relax_min_days_when_download_hit(self):
+        cleaner = self._new_cleaner()
+        cleaner._monitor_download = True
+        cleaner._monitor_downloader = True
+        cleaner._seeding_days = 15
+        cleaner._collect_monitor_usage = lambda: {"download": {}, "library": {}}
+        cleaner._is_threshold_hit = lambda *args, **kwargs: True
+        cleaner._cleanup_by_torrent = lambda *args, **kwargs: None
+
+        min_days_calls = []
+        call_idx = {"i": 0}
+
+        def _pick(min_days, skipped_hashes):
+            min_days_calls.append(min_days)
+            call_idx["i"] += 1
+            if call_idx["i"] == 1:
+                return None
+            if call_idx["i"] == 2:
+                return {"hash": "h1", "downloader": "qb", "name": "n1"}
+            return None
+
+        cleaner._pick_longest_seeding_torrent = _pick
+        cleaner._clean_by_download_threshold()
+
+        self.assertGreaterEqual(len(min_days_calls), 2)
+        self.assertEqual(min_days_calls[0], 15)
+        self.assertEqual(min_days_calls[1], None)
+
+    def test_flow3_trigger_reasons_collect_all(self):
+        cleaner = self._new_cleaner()
+        cleaner._monitor_library = True
+        cleaner._monitor_download = True
+        cleaner._monitor_downloader = True
+        cleaner._library_threshold_mode = "size"
+        cleaner._download_threshold_mode = "size"
+        cleaner._library_threshold_value = 100
+        cleaner._download_threshold_value = 100
+        cleaner._seeding_days = 10
+
+        cleaner._is_threshold_hit = lambda *args, **kwargs: True
+        cleaner._pick_longest_seeding_torrent = lambda *args, **kwargs: {"hash": "x"}
+
+        reasons = cleaner._flow3_trigger_reasons({"library": {}, "download": {}})
+        self.assertIn("媒体库目录阈值", reasons)
+        self.assertIn("资源目录阈值", reasons)
+        self.assertIn("下载器做种时长阈值", reasons)
+
+    def test_clean_by_transfer_history_oldest_run_once(self):
+        cleaner = self._new_cleaner()
+        cleaner._current_run_freed_bytes = 0
+        cleaner._flow3_trigger_reasons = lambda usage: ["资源目录阈值"] if cleaner._current_run_freed_bytes == 0 else []
+        cleaner._collect_monitor_usage = lambda: {"download": {}, "library": {}}
+        cleaner._is_run_limit_reached = lambda actions: False
+        cleaner._pick_oldest_transfer_history = lambda skipped_ids: SimpleNamespace(id=1)
+        cleaner._cleanup_by_transfer_history = lambda history, trigger: {"freed_bytes": 123}
+
+        actions = cleaner._clean_by_transfer_history_oldest()
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(cleaner._current_run_freed_bytes, 123)
+
+    def test_cleanup_by_torrent_scope_requires_mp_history_when_no_hardlink_fallback(self):
+        cleaner = self._new_cleaner()
+        cleaner._media_servers = ["emby"]
+        cleaner._media_libraries = []
+        cleaner._clean_media_data = True
+        cleaner._force_hardlink_cleanup = False
+        cleaner._transfer_oper = SimpleNamespace(list_by_hash=lambda _hash: [])
+        cleaner._library_paths = lambda: [Path("/tmp/library")]
+        cleaner._media_delete_roots = lambda roots: roots
+
+        result = cleaner._cleanup_by_torrent(
+            candidate={"hash": "h1", "downloader": "qb", "name": "n1"},
+            trigger="unit-test",
+            require_mp_history=False,
+        )
+        self.assertIsNone(result)
+
+    def test_cleanup_by_torrent_scope_allow_fallback_but_skip_out_of_library(self):
+        cleaner = self._new_cleaner()
+        cleaner._media_servers = ["emby"]
+        cleaner._clean_media_data = True
+        cleaner._clean_scrape_data = False
+        cleaner._clean_transfer_history = False
+        cleaner._clean_download_history = False
+        cleaner._clean_downloader_seed = False
+        cleaner._force_hardlink_cleanup = True
+        cleaner._dry_run = True
+        cleaner._transfer_oper = SimpleNamespace(list_by_hash=lambda _hash: [])
+        cleaner._count_download_records = lambda _hash: 0
+        cleaner._library_paths = lambda: [Path("/tmp/library")]
+        cleaner._media_delete_roots = lambda roots: roots
+        cleaner._download_file_media_paths = lambda _hash: [Path("/tmp/outside/movie.mkv")]
+        cleaner._expand_media_targets_with_hardlinks = lambda media_targets, roots, context, enabled: media_targets
+
+        result = cleaner._cleanup_by_torrent(
+            candidate={"hash": "h1", "downloader": "qb", "name": "n1"},
+            trigger="unit-test",
+            require_mp_history=False,
+        )
+        self.assertIsNone(result)
+
+    def test_cleanup_by_torrent_scope_allow_fallback_when_target_in_library(self):
+        cleaner = self._new_cleaner()
+        cleaner._media_servers = ["emby"]
+        cleaner._clean_media_data = True
+        cleaner._clean_scrape_data = False
+        cleaner._clean_transfer_history = False
+        cleaner._clean_download_history = False
+        cleaner._clean_downloader_seed = False
+        cleaner._force_hardlink_cleanup = True
+        cleaner._dry_run = True
+        cleaner._transfer_oper = SimpleNamespace(list_by_hash=lambda _hash: [])
+        cleaner._count_download_records = lambda _hash: 0
+        cleaner._is_run_bytes_limit_reached = lambda _b: False
+        cleaner._is_daily_bytes_limit_reached = lambda _b: False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            library_root = Path(temp_dir) / "library"
+            library_root.mkdir()
+            media_file = library_root / "movie.mkv"
+            media_file.write_bytes(b"x")
+
+            cleaner._library_paths = lambda: [library_root]
+            cleaner._media_delete_roots = lambda roots: roots
+            cleaner._download_file_media_paths = lambda _hash: [media_file]
+            cleaner._expand_media_targets_with_hardlinks = lambda media_targets, roots, context, enabled: media_targets
+
+            result = cleaner._cleanup_by_torrent(
+                candidate={"hash": "h1", "downloader": "qb", "name": "n1"},
+                trigger="unit-test",
+                require_mp_history=False,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(((result.get("steps") or {}).get("media") or {}).get("planned"), 1)
+
+    def test_download_file_media_paths_filter_media_ext(self):
+        cleaner = self._new_cleaner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_file = root / "movie.mkv"
+            text_file = root / "readme.txt"
+            media_file.write_bytes(b"m")
+            text_file.write_text("t", encoding="utf-8")
+
+            cleaner._download_oper = SimpleNamespace(
+                get_files_by_hash=lambda _hash: [
+                    SimpleNamespace(fullpath=media_file.as_posix(), savepath="", filepath=""),
+                    SimpleNamespace(fullpath=text_file.as_posix(), savepath="", filepath=""),
+                ]
+            )
+
+            paths = cleaner._download_file_media_paths("h1")
+            self.assertEqual([p.as_posix() for p in paths], [media_file.as_posix()])
 
 
 if __name__ == "__main__":
