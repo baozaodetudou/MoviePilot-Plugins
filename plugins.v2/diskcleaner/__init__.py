@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import threading
 import time
@@ -10,15 +11,17 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.chain.mediaserver import MediaServerChain
 from app.core.config import settings
 from app.db.downloadhistory_oper import DownloadHistoryOper
+from app.db.mediaserver_oper import MediaServerOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.directory import DirectoryHelper
 from app.helper.downloader import DownloaderHelper
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import NotificationType
+from app.schemas import NotificationType, RefreshMediaItem
 from app.utils.system import SystemUtils
 
 
@@ -27,7 +30,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "0.3"
+    plugin_version = "0.4"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_config_prefix = "diskcleaner_"
@@ -78,17 +81,26 @@ class DiskCleaner(_PluginBase):
 
     # 媒体库刷新
     _refresh_mediaserver = False
+    _refresh_mode = "item"  # item/root
     _refresh_servers: List[str] = []
+    _prefer_playback_history = True
+    _library_probe_limit = 30
 
     # 数据操作
     _transfer_oper: Optional[TransferHistoryOper] = None
     _download_oper: Optional[DownloadHistoryOper] = None
+    _mediaserver_oper: Optional[MediaServerOper] = None
+    _mediaserver_chain: Optional[MediaServerChain] = None
+    _playback_ts_cache: Dict[str, int] = {}
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
 
         self._transfer_oper = TransferHistoryOper()
         self._download_oper = DownloadHistoryOper()
+        self._mediaserver_oper = MediaServerOper()
+        self._mediaserver_chain = None
+        self._playback_ts_cache = {}
 
         if config:
             self._enabled = bool(config.get("enabled", False))
@@ -125,7 +137,10 @@ class DiskCleaner(_PluginBase):
             self._path_blocklist = self._parse_path_list(config.get("path_blocklist"))
 
             self._refresh_mediaserver = bool(config.get("refresh_mediaserver", False))
+            self._refresh_mode = config.get("refresh_mode") or "item"
             self._refresh_servers = config.get("refresh_servers") or []
+            self._prefer_playback_history = bool(config.get("prefer_playback_history", True))
+            self._library_probe_limit = int(self._safe_float(config.get("library_probe_limit"), 30))
 
         self._normalize_config()
 
@@ -479,6 +494,47 @@ class DiskCleaner(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{"component": "VSwitch", "props": {"model": "prefer_playback_history", "label": "优先按播放历史判定老化"}}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "library_probe_limit",
+                                            "label": "媒体候选扫描数量",
+                                            "placeholder": "建议 10-100",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "refresh_mode",
+                                            "label": "媒体库刷新方式",
+                                            "items": [
+                                                {"title": "定向刷新(优先)", "value": "item"},
+                                                {"title": "整库刷新", "value": "root"},
+                                            ],
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -574,9 +630,12 @@ class DiskCleaner(_PluginBase):
             "clean_transfer_history": True,
             "clean_download_history": True,
             "mp_only": True,
+            "prefer_playback_history": True,
+            "library_probe_limit": 30,
             "path_allowlist": "",
             "path_blocklist": "",
             "refresh_mediaserver": False,
+            "refresh_mode": "item",
             "refresh_servers": [],
         }
 
@@ -678,6 +737,7 @@ class DiskCleaner(_PluginBase):
             try:
                 logger.info(f"{self.plugin_name}开始执行")
                 self._current_run_freed_bytes = 0
+                self._playback_ts_cache = {}
                 if self._is_in_cooldown():
                     logger.info(f"{self.plugin_name}命中冷却时间，跳过执行")
                     return
@@ -721,7 +781,8 @@ class DiskCleaner(_PluginBase):
                     self._update_daily_freed_bytes(freed_bytes)
 
                 if self._refresh_mediaserver:
-                    refreshed = self._refresh_media_servers()
+                    refresh_items = self._collect_refresh_items(actions)
+                    refreshed = self._refresh_media_servers(refresh_items=refresh_items)
                     if refreshed > 0:
                         logger.info(f"{self.plugin_name}已触发 {refreshed} 个媒体服务器刷新")
 
@@ -889,6 +950,11 @@ class DiskCleaner(_PluginBase):
             f"整理记录{removed_transfer} 下载记录{removed_download}"
         )
         logger.info(f"{self.plugin_name}按媒体文件清理：{media_path.as_posix()} -> {action_text}")
+        refresh_items = []
+        if history:
+            refresh_item = self._build_refresh_item(history=history, target_path=media_path)
+            if refresh_item:
+                refresh_items.append(refresh_item)
 
         return {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -897,6 +963,7 @@ class DiskCleaner(_PluginBase):
             "action": action_text,
             "freed_bytes": freed_bytes,
             "mode": "dry-run" if self._dry_run else "apply",
+            "refresh_items": refresh_items,
         }
 
     def _cleanup_by_torrent(self, candidate: dict, trigger: str) -> Optional[dict]:
@@ -997,6 +1064,11 @@ class DiskCleaner(_PluginBase):
             f"整理记录{removed_transfer} 下载记录{removed_download}"
         )
         logger.info(f"{self.plugin_name}按下载器任务清理：{name}({download_hash}) -> {action_text}")
+        refresh_items = []
+        for history in histories:
+            refresh_item = self._build_refresh_item(history=history, target_path=getattr(history, "dest", None))
+            if refresh_item:
+                refresh_items.append(refresh_item)
 
         return {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1005,6 +1077,7 @@ class DiskCleaner(_PluginBase):
             "action": action_text,
             "freed_bytes": freed_bytes,
             "mode": "dry-run" if self._dry_run else "apply",
+            "refresh_items": refresh_items,
         }
 
     def _pick_oldest_library_media(self, skipped_paths: Optional[set] = None) -> Optional[dict]:
@@ -1014,8 +1087,8 @@ class DiskCleaner(_PluginBase):
 
         skipped_paths = skipped_paths or set()
         media_exts = {ext.lower() for ext in settings.RMT_MEDIAEXT}
-        oldest_path: Optional[Path] = None
-        oldest_atime = None
+        candidates: List[dict] = []
+        need_history = bool(self._transfer_oper and (self._mp_only or self._prefer_playback_history))
 
         for root in library_paths:
             if not root.exists():
@@ -1032,24 +1105,132 @@ class DiskCleaner(_PluginBase):
                         stat = path.stat()
                     except Exception:
                         continue
+                    history = self._transfer_oper.get_by_dest(path.as_posix()) if need_history and self._transfer_oper else None
+                    if self._mp_only and not history:
+                        continue
+                    if history and self._is_history_recent(history):
+                        continue
                     atime = stat.st_atime or stat.st_mtime
-                    if oldest_atime is None or atime < oldest_atime:
-                        if self._mp_only and self._transfer_oper:
-                            history = self._transfer_oper.get_by_dest(path.as_posix())
-                            if not history:
-                                continue
-                            if self._is_history_recent(history):
-                                continue
-                        oldest_atime = atime
-                        oldest_path = path
+                    candidates.append({
+                        "path": path,
+                        "atime": atime,
+                        "history": history,
+                    })
 
-        if not oldest_path:
+        if not candidates:
             return None
 
+        candidates.sort(key=lambda item: item.get("atime") or float("inf"))
+        shortlist = candidates[:max(1, self._library_probe_limit)]
+        selected = shortlist[0]
+        selected_ts = self._effective_access_ts(
+            path=selected.get("path"),
+            history=selected.get("history"),
+            fallback_ts=selected.get("atime"),
+        )
+        for candidate in shortlist[1:]:
+            current_ts = self._effective_access_ts(
+                path=candidate.get("path"),
+                history=candidate.get("history"),
+                fallback_ts=candidate.get("atime"),
+            )
+            if current_ts < selected_ts:
+                selected = candidate
+                selected_ts = current_ts
+
         return {
-            "path": oldest_path,
-            "atime": oldest_atime,
+            "path": selected.get("path"),
+            "atime": selected_ts,
+            "raw_atime": selected.get("atime"),
         }
+
+    def _effective_access_ts(self, path: Optional[Path], history: Any, fallback_ts: Optional[float]) -> int:
+        playback_ts = self._get_history_playback_ts(history)
+        if playback_ts:
+            return int(playback_ts)
+
+        history_ts = self._parse_datetime_to_ts(getattr(history, "date", None)) if history else None
+        if history_ts:
+            return int(history_ts)
+
+        if fallback_ts:
+            return int(fallback_ts)
+
+        try:
+            if path and path.exists():
+                return int(path.stat().st_mtime)
+        except Exception:
+            pass
+        return int(time.time())
+
+    def _get_history_playback_ts(self, history: Any) -> Optional[int]:
+        if not self._prefer_playback_history or not history:
+            return None
+
+        mtype = getattr(history, "type", None)
+        tmdbid = getattr(history, "tmdbid", None)
+        if not mtype or not tmdbid:
+            return None
+
+        season = self._extract_season_number(getattr(history, "seasons", None))
+        cache_key = f"{mtype}:{tmdbid}:{season if season is not None else ''}"
+        cached_ts = self._playback_ts_cache.get(cache_key)
+        if cached_ts is not None:
+            return cached_ts or None
+
+        try:
+            if not self._mediaserver_oper:
+                self._mediaserver_oper = MediaServerOper()
+            media_item = self._mediaserver_oper.exists(
+                tmdbid=tmdbid,
+                mtype=mtype,
+                season=season,
+            )
+            if not media_item:
+                self._playback_ts_cache[cache_key] = 0
+                return None
+
+            server = getattr(media_item, "server", None)
+            item_id = getattr(media_item, "item_id", None)
+            if not server or not item_id:
+                self._playback_ts_cache[cache_key] = 0
+                return None
+
+            if not self._mediaserver_chain:
+                self._mediaserver_chain = MediaServerChain()
+            item_info = self._mediaserver_chain.iteminfo(server=server, item_id=item_id)
+            user_state = getattr(item_info, "user_state", None)
+            last_played = getattr(user_state, "last_played_date", None) if user_state else None
+            ts = self._parse_datetime_to_ts(last_played) or 0
+            self._playback_ts_cache[cache_key] = ts
+            return ts or None
+        except Exception as err:
+            logger.debug(f"{self.plugin_name}读取播放历史失败：{err}")
+            self._playback_ts_cache[cache_key] = 0
+            return None
+
+    @staticmethod
+    def _extract_season_number(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        match = re.search(r"(\d+)", str(value))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_datetime_to_ts(date_text: Optional[str]) -> Optional[int]:
+        if not date_text:
+            return None
+        try:
+            return int(datetime.strptime(str(date_text), "%Y-%m-%d %H:%M:%S").timestamp())
+        except Exception:
+            return None
 
     def _pick_longest_seeding_torrent(self, min_days: Optional[int], skipped_hashes: set) -> Optional[dict]:
         name_filters = self._downloaders if self._downloaders else None
@@ -1292,7 +1473,55 @@ class DiskCleaner(_PluginBase):
 
         return removed
 
-    def _refresh_media_servers(self) -> int:
+    def _collect_refresh_items(self, actions: List[dict]) -> List[RefreshMediaItem]:
+        if not actions:
+            return []
+
+        dedup: Dict[str, RefreshMediaItem] = {}
+        for action in actions:
+            for item in action.get("refresh_items") or []:
+                if isinstance(item, RefreshMediaItem):
+                    refresh_item = item
+                elif isinstance(item, dict):
+                    try:
+                        refresh_item = RefreshMediaItem(**item)
+                    except Exception:
+                        continue
+                else:
+                    continue
+                key = "|".join([
+                    str(refresh_item.title or ""),
+                    str(refresh_item.year or ""),
+                    str(refresh_item.type or ""),
+                    str(refresh_item.target_path or ""),
+                ])
+                dedup[key] = refresh_item
+        return list(dedup.values())
+
+    def _build_refresh_item(self, history: Any, target_path: Any) -> Optional[dict]:
+        if not history:
+            return None
+
+        mtype = getattr(history, "type", None)
+        title = getattr(history, "title", None)
+        year = getattr(history, "year", None)
+        category = getattr(history, "category", None)
+        dest = target_path or getattr(history, "dest", None)
+        if not mtype or not title or not dest:
+            return None
+        try:
+            item = RefreshMediaItem(
+                title=title,
+                year=year,
+                type=mtype,
+                category=category,
+                target_path=Path(dest),
+            )
+            return item.model_dump()
+        except Exception:
+            return None
+
+    def _refresh_media_servers(self, refresh_items: Optional[List[RefreshMediaItem]] = None) -> int:
         services = MediaServerHelper().get_services(
             name_filters=self._refresh_servers if self._refresh_servers else None
         )
@@ -1302,7 +1531,13 @@ class DiskCleaner(_PluginBase):
             if not instance or not hasattr(instance, "refresh_root_library"):
                 continue
             try:
-                state = instance.refresh_root_library()
+                state = None
+                if self._refresh_mode == "item" and refresh_items and hasattr(instance, "refresh_library_by_items"):
+                    state = instance.refresh_library_by_items(refresh_items)
+                    if state is False and hasattr(instance, "refresh_root_library"):
+                        state = instance.refresh_root_library()
+                else:
+                    state = instance.refresh_root_library()
                 if state is not False:
                     refreshed += 1
                     logger.info(f"{self.plugin_name}已刷新媒体服务器：{server_name}")
@@ -1542,6 +1777,8 @@ class DiskCleaner(_PluginBase):
         self._max_gb_per_run = max(0.0, self._safe_float(self._max_gb_per_run, 50.0))
         self._max_gb_per_day = max(0.0, self._safe_float(self._max_gb_per_day, 200.0))
         self._protect_recent_days = max(0, int(self._protect_recent_days))
+        self._library_probe_limit = max(1, min(200, int(self._library_probe_limit)))
+        self._refresh_mode = "item" if self._refresh_mode not in ("item", "root") else self._refresh_mode
         self._downloaders = [str(item).strip() for item in (self._downloaders or []) if str(item).strip()]
         self._refresh_servers = [str(item).strip() for item in (self._refresh_servers or []) if str(item).strip()]
         self._path_allowlist = self._parse_path_list(self._path_allowlist)
@@ -1569,6 +1806,8 @@ class DiskCleaner(_PluginBase):
                 "max_gb_per_run": self._max_gb_per_run,
                 "max_gb_per_day": self._max_gb_per_day,
                 "protect_recent_days": self._protect_recent_days,
+                "prefer_playback_history": self._prefer_playback_history,
+                "library_probe_limit": self._library_probe_limit,
                 "clean_media_data": self._clean_media_data,
                 "clean_scrape_data": self._clean_scrape_data,
                 "clean_downloader_seed": self._clean_downloader_seed,
@@ -1579,6 +1818,7 @@ class DiskCleaner(_PluginBase):
                 "path_allowlist": "\n".join(self._path_allowlist),
                 "path_blocklist": "\n".join(self._path_blocklist),
                 "refresh_mediaserver": self._refresh_mediaserver,
+                "refresh_mode": self._refresh_mode,
                 "refresh_servers": self._refresh_servers,
             }
         )
