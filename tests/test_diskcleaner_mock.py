@@ -525,6 +525,121 @@ class DiskCleanerMockTest(unittest.TestCase):
             self.assertEqual(((result.get("steps") or {}).get("media") or {}).get("done"), 1)
             self.assertEqual(((result.get("steps") or {}).get("scrape") or {}).get("done"), 1)
 
+    def test_resolve_media_cleanup_target_movie_uses_parent_dir_and_logs(self):
+        cleaner = self._new_cleaner()
+        original_logger = self.plugin_mod.logger
+        info_logs = []
+        warning_logs = []
+        self.plugin_mod.logger = SimpleNamespace(
+            info=lambda msg, *args, **kwargs: info_logs.append(str(msg)),
+            warning=lambda msg, *args, **kwargs: warning_logs.append(str(msg)),
+            error=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            movie_dir = root / "movie-demo"
+            movie_dir.mkdir()
+            movie_file = movie_dir / "movie.mkv"
+            movie_file.write_bytes(b"movie")
+            history = SimpleNamespace(type="电影", seasons=None)
+            target = cleaner._resolve_media_cleanup_target(movie_file, history=history, roots=[root])
+
+        self.plugin_mod.logger = original_logger
+        self.assertEqual(target.as_posix() if target else "", movie_dir.as_posix())
+        self.assertFalse(any("未能识别电视剧季目录" in msg for msg in warning_logs))
+        self.assertTrue(any("电影清理目标目录" in msg for msg in info_logs))
+
+    def test_resolve_media_cleanup_target_tv_uses_current_season_only(self):
+        cleaner = self._new_cleaner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            show_dir = root / "Show"
+            season1 = show_dir / "Season 01"
+            season2 = show_dir / "Season 02"
+            season1.mkdir(parents=True)
+            season2.mkdir(parents=True)
+            episode = season1 / "S01E01.mkv"
+            episode.write_bytes(b"tv")
+            history = SimpleNamespace(type="电视剧", seasons="S01")
+            target = cleaner._resolve_media_cleanup_target(episode, history=history, roots=[root])
+
+        self.assertIsNotNone(target)
+        self.assertEqual(target.as_posix(), season1.as_posix())
+        self.assertNotEqual(target.as_posix(), show_dir.as_posix())
+
+    def test_resolve_media_cleanup_target_tv_unrecognized_season_logs_warning(self):
+        cleaner = self._new_cleaner()
+        original_logger = self.plugin_mod.logger
+        warning_logs = []
+        self.plugin_mod.logger = SimpleNamespace(
+            info=lambda *args, **kwargs: None,
+            warning=lambda msg, *args, **kwargs: warning_logs.append(str(msg)),
+            error=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            show_dir = root / "Show" / "Episodes"
+            show_dir.mkdir(parents=True)
+            episode = show_dir / "E01.mkv"
+            episode.write_bytes(b"tv")
+            history = SimpleNamespace(type="电视剧", seasons="S03")
+            target = cleaner._resolve_media_cleanup_target(episode, history=history, roots=[root])
+
+        self.plugin_mod.logger = original_logger
+        self.assertIsNone(target)
+        self.assertTrue(any("未能识别电视剧季目录" in msg for msg in warning_logs))
+
+    def test_collect_hardlink_siblings_in_directory_discovers_external_links(self):
+        cleaner = self._new_cleaner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            season_dir = root / "library" / "Show" / "Season 01"
+            season_dir.mkdir(parents=True)
+            download_dir = root / "download"
+            download_dir.mkdir(parents=True)
+
+            season_file = season_dir / "S01E01.mkv"
+            season_file.write_bytes(b"tv-hardlink")
+            download_file = download_dir / "S01E01.mkv"
+            os.link(season_file, download_file)
+
+            siblings = cleaner._collect_hardlink_siblings_in_directory(
+                media_dir=season_dir,
+                roots=[root / "library", download_dir],
+            )
+            sibling_paths = {item.as_posix() for item in siblings}
+            self.assertIn(download_file.as_posix(), sibling_paths)
+            self.assertNotIn(season_file.as_posix(), sibling_paths)
+
+    def test_expand_media_targets_with_hardlinks_orders_files_before_dirs(self):
+        cleaner = self._new_cleaner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            season_dir = root / "library" / "Show" / "Season 01"
+            season_dir.mkdir(parents=True)
+            download_dir = root / "download"
+            download_dir.mkdir(parents=True)
+
+            season_file = season_dir / "S01E01.mkv"
+            season_file.write_bytes(b"tv-hardlink")
+            download_file = download_dir / "S01E01.mkv"
+            os.link(season_file, download_file)
+
+            targets = cleaner._expand_media_targets_with_hardlinks(
+                media_targets=[season_dir],
+                roots=[root / "library", download_dir],
+                context="unit-test",
+                enabled=True,
+            )
+            self.assertGreaterEqual(len(targets), 2)
+            self.assertTrue(targets[0].is_file())
+            self.assertTrue(any(item.as_posix() == season_dir.as_posix() for item in targets))
+            self.assertTrue(any(item.as_posix() == download_file.as_posix() for item in targets))
+
     def test_clean_by_download_threshold_skip_when_no_trigger(self):
         cleaner = self._new_cleaner()
         cleaner._monitor_download = True

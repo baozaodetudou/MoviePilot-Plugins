@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.28"
+    plugin_version = "1.0"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -1672,23 +1672,32 @@ class DiskCleaner(_PluginBase):
 
         dest = getattr(history, "dest", None)
         media_path = self._resolve_local_media_path(dest)
-        target_text = media_path.as_posix() if media_path else (str(dest) if dest else "-")
         download_hash = getattr(history, "download_hash", None)
         downloader = getattr(history, "downloader", None)
         if self._clean_download_history and not download_hash:
             logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
         library_paths = self._library_paths()
         delete_roots = self._media_delete_roots(library_paths)
+        cleanup_target = self._resolve_media_cleanup_target(
+            media_path=media_path,
+            history=history,
+            roots=delete_roots,
+        )
+        target_text = cleanup_target.as_posix() if cleanup_target else (str(dest) if dest else "-")
         scope_enabled = self._is_cleanup_scope_enabled()
         if scope_enabled:
             if not media_path or not self._is_path_in_roots(media_path, library_paths):
                 logger.info(f"{self.plugin_name}整理记录不在所选媒体库范围内，跳过：{dest or '-'}")
                 return None
 
-        sidecars = self._collect_scrape_files(media_path) if media_path and self._clean_scrape_data else []
+        sidecars = (
+            self._collect_scrape_files(cleanup_target)
+            if cleanup_target and self._clean_scrape_data
+            else []
+        )
         media_targets: List[Path] = []
-        if self._clean_media_data and media_path and media_path.exists():
-            media_targets.append(media_path)
+        if self._clean_media_data and cleanup_target and cleanup_target.exists():
+            media_targets.append(cleanup_target)
         media_targets = self._expand_media_targets_with_hardlinks(
             media_targets=media_targets,
             roots=delete_roots,
@@ -1850,23 +1859,32 @@ class DiskCleaner(_PluginBase):
 
         library_paths = self._library_paths()
         delete_roots = self._media_delete_roots(library_paths)
-        sidecars = self._collect_scrape_files(media_path) if self._clean_scrape_data else []
+        cleanup_target = self._resolve_media_cleanup_target(
+            media_path=media_path,
+            history=history,
+            roots=delete_roots,
+        )
+        sidecars = (
+            self._collect_scrape_files(cleanup_target)
+            if cleanup_target and self._clean_scrape_data
+            else []
+        )
         media_targets: List[Path] = []
-        if self._clean_media_data and media_path.exists():
-            media_targets.append(media_path)
+        if self._clean_media_data and cleanup_target and cleanup_target.exists():
+            media_targets.append(cleanup_target)
         # 兜底策略：当缺失MP关联时，按硬链接关系清理同inode文件（常见于下载目录与媒体库硬链接）。
-        if self._force_hardlink_cleanup and self._clean_media_data and not history:
+        if self._force_hardlink_cleanup and self._clean_media_data and not history and cleanup_target:
             media_targets = self._expand_media_targets_with_hardlinks(
                 media_targets=media_targets,
                 roots=delete_roots,
-                context=media_path.as_posix(),
+                context=cleanup_target.as_posix(),
                 enabled=True,
             )
         else:
             media_targets = self._expand_media_targets_with_hardlinks(
                 media_targets=media_targets,
                 roots=delete_roots,
-                context=media_path.as_posix(),
+                context=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
                 enabled=False,
             )
 
@@ -1890,7 +1908,7 @@ class DiskCleaner(_PluginBase):
 
         self._log_cleanup_plan(
             trigger=trigger,
-            target=media_path.as_posix(),
+            target=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
             planned_media=planned_media,
             planned_scrape=planned_scrape,
             planned_downloader=planned_downloader,
@@ -2042,6 +2060,11 @@ class DiskCleaner(_PluginBase):
                 if not dest:
                     continue
                 path = self._resolve_local_media_path(dest)
+                path = self._resolve_media_cleanup_target(
+                    media_path=path,
+                    history=history,
+                    roots=delete_roots,
+                )
                 if not path:
                     continue
                 if path.as_posix() in handled_paths:
@@ -2052,6 +2075,9 @@ class DiskCleaner(_PluginBase):
                 if self._clean_scrape_data:
                     sidecar_targets.extend([item for item in self._collect_scrape_files(path) if item.exists()])
             for path in download_file_targets:
+                folder_target = self._media_cleanup_dir_from_path(path)
+                if folder_target and not any(folder_target == root for root in delete_roots):
+                    path = folder_target
                 if path.as_posix() in handled_paths:
                     continue
                 handled_paths.add(path.as_posix())
@@ -3068,6 +3094,77 @@ class DiskCleaner(_PluginBase):
         )
         return list(siblings.values())
 
+    def _collect_hardlink_siblings_in_directory(self, media_dir: Path, roots: List[Path]) -> List[Path]:
+        try:
+            base_dir = Path(media_dir)
+            if not base_dir.exists() or not base_dir.is_dir() or base_dir.is_symlink():
+                logger.info(f"{self.plugin_name}目录硬链接扫描跳过：{base_dir.as_posix()}（不存在/非目录/符号链接）")
+                return []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}目录硬链接扫描失败，无法读取目录：{media_dir} err={err}")
+            return []
+
+        inode_keys = set()
+        scanned_sources = 0
+        for current_root, _, files in os.walk(base_dir.as_posix()):
+            for filename in files:
+                path = Path(current_root) / filename
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    stat = path.stat()
+                except Exception:
+                    continue
+                scanned_sources += 1
+                if int(getattr(stat, "st_nlink", 1) or 1) <= 1:
+                    continue
+                inode_keys.add((int(stat.st_dev), int(stat.st_ino)))
+
+        if not inode_keys:
+            logger.info(
+                f"{self.plugin_name}目录硬链接扫描跳过：{base_dir.as_posix()} "
+                f"（目录文件={scanned_sources}，无可扩展硬链接）"
+            )
+            return []
+
+        active_roots: List[Path] = []
+        for root in roots or []:
+            try:
+                if root.exists():
+                    active_roots.append(root)
+            except Exception:
+                continue
+        if not active_roots:
+            logger.info(f"{self.plugin_name}目录硬链接扫描跳过：{base_dir.as_posix()}（无可扫描根目录）")
+            return []
+
+        logger.info(
+            f"{self.plugin_name}目录硬链接扫描开始：目录={base_dir.as_posix()} "
+            f"候选inode={len(inode_keys)} 根目录={len(active_roots)}"
+        )
+        siblings: Dict[str, Path] = {}
+        scanned_files = 0
+        for root in active_roots:
+            for current_root, _, files in os.walk(root.as_posix()):
+                for filename in files:
+                    path = Path(current_root) / filename
+                    try:
+                        if path.is_symlink() or not path.is_file():
+                            continue
+                        if path.is_relative_to(base_dir):
+                            continue
+                        stat = path.stat()
+                    except Exception:
+                        continue
+                    scanned_files += 1
+                    if (int(stat.st_dev), int(stat.st_ino)) in inode_keys:
+                        siblings[path.as_posix()] = path
+        logger.info(
+            f"{self.plugin_name}目录硬链接扫描完成：目录={base_dir.as_posix()} "
+            f"扫描文件={scanned_files} 命中关联文件={len(siblings)}"
+        )
+        return list(siblings.values())
+
     def _expand_media_targets_with_hardlinks(
         self,
         media_targets: List[Path],
@@ -3080,12 +3177,21 @@ class DiskCleaner(_PluginBase):
             if item:
                 dedup[item.as_posix()] = item
         if not enabled or not dedup:
-            return list(dedup.values())
+            return self._order_delete_targets(list(dedup.values()))
 
         origin = list(dedup.values())
         added_count = 0
         for target in origin:
-            for sibling in self._collect_hardlink_siblings(target, roots=roots):
+            sibling_paths: List[Path] = []
+            try:
+                if target.exists() and target.is_dir() and not target.is_symlink():
+                    sibling_paths = self._collect_hardlink_siblings_in_directory(target, roots=roots)
+                else:
+                    sibling_paths = self._collect_hardlink_siblings(target, roots=roots)
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}硬链接扩展失败，已跳过目标：{target.as_posix()} err={err}")
+                sibling_paths = []
+            for sibling in sibling_paths:
                 key = sibling.as_posix()
                 if key in dedup:
                     continue
@@ -3095,7 +3201,23 @@ class DiskCleaner(_PluginBase):
             logger.warning(f"{self.plugin_name}触发硬链接兜底删除，新增 {added_count} 个关联文件：{context}")
         else:
             logger.info(f"{self.plugin_name}硬链接兜底扫描未发现新增关联文件：{context}")
-        return list(dedup.values())
+        return self._order_delete_targets(list(dedup.values()))
+
+    @staticmethod
+    def _order_delete_targets(paths: List[Path]) -> List[Path]:
+        files: List[Path] = []
+        dirs: List[Path] = []
+        for path in paths or []:
+            try:
+                if path.exists() and path.is_dir() and not path.is_symlink():
+                    dirs.append(path)
+                else:
+                    files.append(path)
+            except Exception:
+                files.append(path)
+        files.sort(key=lambda item: len(item.as_posix()), reverse=True)
+        dirs.sort(key=lambda item: len(item.as_posix()), reverse=True)
+        return files + dirs
 
     def _download_file_media_paths(self, download_hash: Optional[str]) -> List[Path]:
         if not self._download_oper or not download_hash:
@@ -3206,6 +3328,9 @@ class DiskCleaner(_PluginBase):
         if not media_path:
             return []
         media_path = Path(media_path)
+        if media_path.is_dir():
+            # 目录级清理时由目录删除统一处理，避免重复统计。
+            return []
         parent = media_path.parent
         if not parent.exists() or not parent.is_dir():
             return []
@@ -4025,7 +4150,20 @@ class DiskCleaner(_PluginBase):
             if path and path.exists() and path.is_file():
                 return int(path.stat().st_size)
             if path and path.exists() and path.is_dir():
-                return int(SystemUtils.get_directory_size(path))
+                try:
+                    return int(SystemUtils.get_directory_size(path))
+                except Exception:
+                    total = 0
+                    for current_root, _, files in os.walk(path.as_posix()):
+                        for filename in files:
+                            item = Path(current_root) / filename
+                            try:
+                                if item.is_symlink() or not item.is_file():
+                                    continue
+                                total += int(item.stat().st_size)
+                            except Exception:
+                                continue
+                    return int(total)
         except Exception:
             return 0
         return 0
@@ -4192,6 +4330,110 @@ class DiskCleaner(_PluginBase):
             history = self._transfer_oper.get_by_dest(candidate_dest)
             if history:
                 return history
+        return None
+
+    def _resolve_media_cleanup_target(
+        self,
+        media_path: Optional[Path],
+        history: Any,
+        roots: List[Path],
+    ) -> Optional[Path]:
+        if not media_path:
+            return None
+        cleanup_target = self._media_cleanup_dir_from_path(media_path) or media_path
+        media_type = self._history_media_type_key(history)
+        if media_type == "tv":
+            season_root = self._tv_season_root_from_media_path(cleanup_target, history=history)
+            if not season_root:
+                logger.warning(f"{self.plugin_name}未能识别电视剧季目录，跳过媒体删除：{cleanup_target.as_posix()}")
+                return None
+            if season_root.as_posix() != cleanup_target.as_posix():
+                logger.info(
+                    f"{self.plugin_name}电视剧清理目标切换为季目录："
+                    f"{cleanup_target.as_posix()} -> {season_root.as_posix()}"
+                )
+            else:
+                logger.info(f"{self.plugin_name}电视剧清理目标识别为季目录：{season_root.as_posix()}")
+            cleanup_target = season_root
+        elif media_type == "movie" and cleanup_target.as_posix() != Path(media_path).as_posix():
+            logger.info(f"{self.plugin_name}电影清理目标目录：{cleanup_target.as_posix()}")
+
+        if not self._is_path_in_roots(cleanup_target, roots):
+            return cleanup_target
+        for root in roots:
+            if cleanup_target == root:
+                logger.warning(f"{self.plugin_name}清理目标命中根目录，回退原始路径：{Path(media_path).as_posix()}")
+                return media_path
+        return cleanup_target
+
+    @staticmethod
+    def _media_cleanup_dir_from_path(media_path: Optional[Path]) -> Optional[Path]:
+        if not media_path:
+            return None
+        path = Path(media_path)
+        if path.is_dir():
+            return path
+        parent = path.parent
+        if not parent:
+            return None
+        return parent
+
+    def _tv_season_root_from_media_path(self, media_path: Path, history: Any) -> Optional[Path]:
+        path = Path(media_path)
+        if path.is_dir():
+            node = path
+        else:
+            parent = path.parent
+            if not parent:
+                return None
+            node = parent
+
+        season_num = self._extract_season_number(getattr(history, "seasons", None)) if history else None
+        if self._looks_like_tv_season_dir(node.name, season=season_num):
+            return node
+
+        if season_num is None:
+            return None
+
+        if node.exists() and node.is_dir():
+            matches: List[Path] = []
+            for child in node.iterdir():
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                if self._looks_like_tv_season_dir(child.name, season=season_num):
+                    matches.append(child)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                matches.sort(key=lambda item: item.as_posix())
+                return matches[0]
+        return None
+
+    @staticmethod
+    def _looks_like_tv_season_dir(name: Any, season: Optional[int] = None) -> bool:
+        season_num = DiskCleaner._extract_season_from_dir_name(name)
+        if season_num is None:
+            return False
+        if season is None:
+            return True
+        return int(season_num) == int(season)
+
+    @staticmethod
+    def _extract_season_from_dir_name(name: Any) -> Optional[int]:
+        text = str(name or "").strip()
+        if not text:
+            return None
+        normalized = re.sub(r"[._-]+", " ", text).strip().lower()
+        compact = re.sub(r"\s+", "", normalized)
+        english = re.match(r"^(season|seasons?)\s*(\d+)$", normalized)
+        if english:
+            return int(english.group(2))
+        s_style = re.match(r"^s(\d{1,2})$", compact)
+        if s_style:
+            return int(s_style.group(1))
+        chinese = re.match(r"^第\s*(\d+)\s*季$", text)
+        if chinese:
+            return int(chinese.group(1))
         return None
 
     def _resolve_local_media_path(self, dest_path: Any) -> Optional[Path]:
