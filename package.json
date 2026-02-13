@@ -41,12 +41,13 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
-        "version": "1.1",
+        "version": "1.2",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
         "level": 2,
         "history": {
+            "v1.2": "新增 download_hash 缺失兜底：按媒体文件路径反查下载记录并补全 hash/downloader，提升流程1/流程3联动删除下载记录与删种成功率。",
             "v1.1": "新增任务完成清理明细汇总日志：按条输出清理目标、触发原因、执行结果与释放容量，便于核验为何被清理。",
             "v1.0": "删除逻辑升级为目录级：电影按目录删除、电视剧按当前季目录删除；新增目录级硬链接扫描与先扫描后删除流程；补充对应测试用例。",
             "v0.28": "修复下载器统计口径偏差：完成/下载中/暂停改为基于全任务状态统一计算，qb 与 TR 统计一致；符合条件继续按清理规则单独计算。",

@@ -1167,6 +1167,56 @@ class DiskCleanerMockTest(unittest.TestCase):
         self.assertIn("原因=媒体库目录命中阈值", merged)
         self.assertIn("本轮清理明细结束", merged)
 
+    def test_resolve_download_context_fallback_by_media_fullpath(self):
+        cleaner = self._new_cleaner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_file = root / "movie.mkv"
+            media_file.write_bytes(b"x")
+
+            cleaner._download_oper = SimpleNamespace(
+                get_files_by_fullpath=lambda fullpath: [
+                    SimpleNamespace(download_hash="h-fallback-1", downloader="qb")
+                ] if fullpath == media_file.as_posix() else [],
+                get_by_hash=lambda _hash: None,
+            )
+            cleaner._transfer_oper = SimpleNamespace(list_by_hash=lambda _hash: [])
+
+            resolved_hash, resolved_downloader = cleaner._resolve_download_context_fallback(
+                download_hash=None,
+                downloader=None,
+                lookup_paths=[media_file],
+                context=media_file.as_posix(),
+            )
+
+            self.assertEqual(resolved_hash, "h-fallback-1")
+            self.assertEqual(resolved_downloader, "qb")
+
+    def test_resolve_download_context_fallback_downloader_from_download_history(self):
+        cleaner = self._new_cleaner()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_file = root / "movie.mkv"
+            media_file.write_bytes(b"x")
+
+            cleaner._download_oper = SimpleNamespace(
+                get_files_by_fullpath=lambda fullpath: [
+                    SimpleNamespace(download_hash="h-fallback-2", downloader="")
+                ] if fullpath == media_file.as_posix() else [],
+                get_by_hash=lambda _hash: SimpleNamespace(download_hash="h-fallback-2", downloader="tr"),
+            )
+            cleaner._transfer_oper = SimpleNamespace(list_by_hash=lambda _hash: [])
+
+            resolved_hash, resolved_downloader = cleaner._resolve_download_context_fallback(
+                download_hash=None,
+                downloader=None,
+                lookup_paths=[media_file],
+                context=media_file.as_posix(),
+            )
+
+            self.assertEqual(resolved_hash, "h-fallback-2")
+            self.assertEqual(resolved_downloader, "tr")
+
 
 if __name__ == "__main__":
     unittest.main()

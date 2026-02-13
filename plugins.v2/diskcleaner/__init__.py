@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -1718,8 +1718,6 @@ class DiskCleaner(_PluginBase):
         media_path = self._resolve_local_media_path(dest)
         download_hash = getattr(history, "download_hash", None)
         downloader = getattr(history, "downloader", None)
-        if self._clean_download_history and not download_hash:
-            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
         library_paths = self._library_paths()
         delete_roots = self._media_delete_roots(library_paths)
         cleanup_target = self._resolve_media_cleanup_target(
@@ -1728,6 +1726,14 @@ class DiskCleaner(_PluginBase):
             roots=delete_roots,
         )
         target_text = cleanup_target.as_posix() if cleanup_target else (str(dest) if dest else "-")
+        download_hash, downloader = self._resolve_download_context_fallback(
+            download_hash=download_hash,
+            downloader=downloader,
+            lookup_paths=[cleanup_target, media_path],
+            context=target_text,
+        )
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
         scope_enabled = self._is_cleanup_scope_enabled()
         if scope_enabled:
             if not media_path or not self._is_path_in_roots(media_path, library_paths):
@@ -1893,13 +1899,6 @@ class DiskCleaner(_PluginBase):
             return None
         download_hash = getattr(history, "download_hash", None) if history else None
         downloader = getattr(history, "downloader", None) if history else None
-        if self._clean_transfer_history and not history and not download_hash:
-            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过整理记录删除：{media_path.as_posix()}")
-        if self._clean_download_history and not download_hash:
-            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{media_path.as_posix()}")
-        if require_torrent_link and not (history and download_hash and downloader):
-            logger.info(f"{self.plugin_name}流程要求MP与下载器均可关联，跳过：{media_path.as_posix()}")
-            return None
 
         library_paths = self._library_paths()
         delete_roots = self._media_delete_roots(library_paths)
@@ -1908,6 +1907,20 @@ class DiskCleaner(_PluginBase):
             history=history,
             roots=delete_roots,
         )
+        download_hash, downloader = self._resolve_download_context_fallback(
+            download_hash=download_hash,
+            downloader=downloader,
+            lookup_paths=[cleanup_target, media_path],
+            context=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
+        )
+        if self._clean_transfer_history and not history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过整理记录删除：{media_path.as_posix()}")
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{media_path.as_posix()}")
+        if require_torrent_link and not (history and download_hash and downloader):
+            logger.info(f"{self.plugin_name}流程要求MP与下载器均可关联，跳过：{media_path.as_posix()}")
+            return None
+
         sidecars = (
             self._collect_scrape_files(cleanup_target)
             if cleanup_target and self._clean_scrape_data
@@ -3306,6 +3319,161 @@ class DiskCleaner(_PluginBase):
             if file_path_obj.is_absolute():
                 candidates.append(file_path_obj.as_posix())
         return candidates
+
+    def _resolve_download_context_fallback(
+        self,
+        download_hash: Optional[str],
+        downloader: Optional[str],
+        lookup_paths: Optional[List[Optional[Path]]],
+        context: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        hash_text = str(download_hash or "").strip() or None
+        downloader_text = str(downloader or "").strip() or None
+        if hash_text and downloader_text:
+            return hash_text, downloader_text
+        if not self._download_oper:
+            return hash_text, downloader_text
+
+        hash_votes: Dict[str, int] = {}
+        hash_downloader: Dict[str, str] = {}
+        checked_files = 0
+        for fullpath in self._iter_media_fullpaths_for_hash_lookup(lookup_paths):
+            checked_files += 1
+            for fileinfo in self._download_file_records_by_fullpath(fullpath):
+                file_hash = str(getattr(fileinfo, "download_hash", "") or "").strip()
+                if not file_hash:
+                    continue
+                hash_votes[file_hash] = hash_votes.get(file_hash, 0) + 1
+                file_downloader = str(getattr(fileinfo, "downloader", "") or "").strip()
+                if file_downloader and file_hash not in hash_downloader:
+                    hash_downloader[file_hash] = file_downloader
+
+        if not hash_text and hash_votes:
+            sorted_hashes = sorted(hash_votes.items(), key=lambda item: (-int(item[1]), str(item[0])))
+            hash_text = sorted_hashes[0][0]
+
+        if not hash_text:
+            get_by_path = getattr(self._download_oper, "get_by_path", None)
+            if callable(get_by_path):
+                for raw_path in lookup_paths or []:
+                    if not raw_path:
+                        continue
+                    try:
+                        history = get_by_path(Path(raw_path).as_posix())
+                    except Exception:
+                        history = None
+                    if not history:
+                        continue
+                    candidate_hash = str(getattr(history, "download_hash", "") or "").strip()
+                    if candidate_hash:
+                        hash_text = candidate_hash
+                        candidate_downloader = str(getattr(history, "downloader", "") or "").strip()
+                        if candidate_downloader:
+                            downloader_text = candidate_downloader
+                        break
+
+        if hash_text and not downloader_text:
+            downloader_text = hash_downloader.get(hash_text)
+            if not downloader_text:
+                get_by_hash = getattr(self._download_oper, "get_by_hash", None)
+                if callable(get_by_hash):
+                    try:
+                        history = get_by_hash(hash_text)
+                    except Exception:
+                        history = None
+                    if history:
+                        downloader_text = str(getattr(history, "downloader", "") or "").strip() or None
+            if not downloader_text and self._transfer_oper:
+                try:
+                    transfer_items = self._transfer_oper.list_by_hash(hash_text) or []
+                except Exception:
+                    transfer_items = []
+                for item in transfer_items:
+                    candidate = str(getattr(item, "downloader", "") or "").strip()
+                    if candidate:
+                        downloader_text = candidate
+                        break
+
+        if (not download_hash and hash_text) or (not downloader and downloader_text):
+            logger.info(
+                f"{self.plugin_name}下载记录兜底命中：目标={context} "
+                f"hash={hash_text or '-'} downloader={downloader_text or '-'} "
+                f"来源=媒体路径反查 扫描文件={checked_files}"
+            )
+        return hash_text, downloader_text
+
+    def _iter_media_fullpaths_for_hash_lookup(self, paths: Optional[List[Optional[Path]]]) -> List[str]:
+        allowed_exts = {
+            str(ext).strip().lower()
+            for ext in (getattr(settings, "RMT_MEDIAEXT", []) or [])
+            if str(ext).strip()
+        }
+        files: Dict[str, bool] = {}
+        for raw_path in paths or []:
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            try:
+                if not path.exists() and not path.is_symlink():
+                    continue
+            except Exception:
+                continue
+            try:
+                if path.is_file() or path.is_symlink():
+                    if allowed_exts and path.suffix.lower() not in allowed_exts:
+                        continue
+                    files[path.as_posix()] = True
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    for current_root, _, filenames in os.walk(path.as_posix()):
+                        for filename in filenames:
+                            file_path = Path(current_root) / filename
+                            try:
+                                if not file_path.is_file() and not file_path.is_symlink():
+                                    continue
+                            except Exception:
+                                continue
+                            if allowed_exts and file_path.suffix.lower() not in allowed_exts:
+                                continue
+                            files[file_path.as_posix()] = True
+            except Exception:
+                continue
+        return list(files.keys())
+
+    def _download_file_records_by_fullpath(self, fullpath: str) -> List[Any]:
+        if not self._download_oper or not fullpath:
+            return []
+
+        records: List[Any] = []
+        get_files_by_fullpath = getattr(self._download_oper, "get_files_by_fullpath", None)
+        if callable(get_files_by_fullpath):
+            try:
+                items = get_files_by_fullpath(fullpath) or []
+                if isinstance(items, list):
+                    records.extend(items)
+            except Exception:
+                pass
+
+        if not records:
+            get_file_by_fullpath = getattr(self._download_oper, "get_file_by_fullpath", None)
+            if callable(get_file_by_fullpath):
+                try:
+                    item = get_file_by_fullpath(fullpath)
+                except Exception:
+                    item = None
+                if item:
+                    records.append(item)
+
+        if not records:
+            get_hash_by_fullpath = getattr(self._download_oper, "get_hash_by_fullpath", None)
+            if callable(get_hash_by_fullpath):
+                try:
+                    fallback_hash = str(get_hash_by_fullpath(fullpath) or "").strip()
+                except Exception:
+                    fallback_hash = ""
+                if fallback_hash:
+                    records.append(type("HashOnly", (), {"download_hash": fallback_hash, "downloader": ""})())
+        return records
 
     def _delete_local_item(self, path: Path, roots: List[Path]) -> bool:
         path = Path(path)
