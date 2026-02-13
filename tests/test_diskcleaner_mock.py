@@ -336,7 +336,38 @@ class DiskCleanerMockTest(unittest.TestCase):
         page = cleaner.get_page()
         payload = json.dumps(page, ensure_ascii=False)
         self.assertIn("任务执行历史（最近10轮）", payload)
-        self.assertIn("高密度视图", payload)
+
+    def test_usage_card_contains_directory_paths(self):
+        cleaner = self._new_cleaner()
+        cleaner._collect_monitor_usage = lambda: {
+            "download": {
+                "paths": ["/media/down/a", "/media/down/b"],
+                "total": 1,
+                "free": 1,
+                "used": 0,
+                "used_percent": 0,
+                "free_percent": 100,
+                "total_text": "1 B",
+                "free_text": "1 B",
+                "used_text": "0 B",
+            },
+            "library": {
+                "paths": ["/media/link/a"],
+                "total": 1,
+                "free": 1,
+                "used": 0,
+                "used_percent": 0,
+                "free_percent": 100,
+                "total_text": "1 B",
+                "free_text": "1 B",
+                "used_text": "0 B",
+            },
+        }
+        cleaner._collect_run_history = lambda: []
+        payload = json.dumps(cleaner.get_page(), ensure_ascii=False)
+        self.assertIn("目录路径", payload)
+        self.assertIn("/media/down/a", payload)
+        self.assertIn("/media/link/a", payload)
 
     def test_build_refresh_item_is_json_serializable(self):
         cleaner = self._new_cleaner()

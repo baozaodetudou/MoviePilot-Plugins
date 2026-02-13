@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.20"
+    plugin_version = "0.21"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -1006,7 +1006,6 @@ class DiskCleaner(_PluginBase):
                 "props": {"variant": "outlined"},
                 "content": [
                     {"component": "VCardTitle", "text": "任务执行历史（最近10轮）"},
-                    {"component": "VCardSubtitle", "text": "高密度视图：状态/容量/明细"},
                     {"component": "VDivider"},
                     {"component": "VCardText", "props": {"class": "py-1 px-2"}, "content": history_cards},
                 ],
@@ -3505,6 +3504,31 @@ class DiskCleaner(_PluginBase):
         free_percent = float(usage.get("free_percent", 0) or 0)
         free_percent = max(0.0, min(100.0, free_percent))
         progress_color = "error" if trigger else ("success" if enabled else "info")
+        path_preview = [str(item) for item in paths[:10]]
+        path_items = [
+            {
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                "text": f"{idx}. {path}",
+            }
+            for idx, path in enumerate(path_preview, 1)
+        ]
+        if not path_items:
+            path_items = [
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis"},
+                    "text": "目录路径：无",
+                }
+            ]
+        elif len(paths) > len(path_preview):
+            path_items.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis"},
+                    "text": f"... 其余 {len(paths) - len(path_preview)} 条目录已省略",
+                }
+            )
 
         return {
             "component": "VCol",
@@ -3562,6 +3586,8 @@ class DiskCleaner(_PluginBase):
                                     "props": {"class": "text-caption mt-1 text-medium-emphasis text-truncate"},
                                     "text": f"总 {usage.get('total_text', '0 B')} | 可用 {free_percent:.1f}% | 路径 {len(paths)}",
                                 },
+                                {"component": "div", "props": {"class": "text-caption mt-1 font-weight-bold"}, "text": "目录路径"},
+                                {"component": "div", "props": {"class": "mt-1"}, "content": path_items},
                             ],
                         },
                     ],
