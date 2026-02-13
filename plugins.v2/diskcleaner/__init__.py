@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.22"
+    plugin_version = "0.23"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -3540,7 +3540,8 @@ class DiskCleaner(_PluginBase):
                     "text": "无目录路径",
                 }
             ]
-        elif len(path_chip_items) > 3:
+        # 无法在后端精确获知前端换行结果，使用保守阈值避免“明明全显示却仍出现省略号”。
+        elif len(path_chip_items) > 8:
             path_content.append(
                 {
                     "component": "div",
