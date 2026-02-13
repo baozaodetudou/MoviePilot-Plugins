@@ -41,12 +41,13 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
-        "version": "0.21",
+        "version": "0.22",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
         "level": 2,
         "history": {
+            "v0.22": "监控路径展示优化：目录路径改为模块化块状展示（自动换行），最多显示三行并以省略号提示；悬停可查看完整路径列表。",
             "v0.21": "监控视图增强：空间监控卡片新增目录路径明细展示（紧凑列表），可直接查看资源目录与媒体库目录的具体路径。",
             "v0.20": "修复稳定性问题：清理历史入库前统一做JSON安全转换，解决 MediaType/Path 等对象导致的序列化异常；补充对应回归测试。",
             "v0.19": "日志可核验增强：流程1增加扫描目录清单与候选扫描开始/结束统计；未命中时直接输出过滤原因摘要；空间日志补充可用GiB显示，便于阈值判断。",

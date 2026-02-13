@@ -341,7 +341,12 @@ class DiskCleanerMockTest(unittest.TestCase):
         cleaner = self._new_cleaner()
         cleaner._collect_monitor_usage = lambda: {
             "download": {
-                "paths": ["/media/down/a", "/media/down/b"],
+                "paths": [
+                    "/media/down/a",
+                    "/media/down/b",
+                    "/media/down/c",
+                    "/media/down/d",
+                ],
                 "total": 1,
                 "free": 1,
                 "used": 0,
@@ -366,6 +371,8 @@ class DiskCleanerMockTest(unittest.TestCase):
         cleaner._collect_run_history = lambda: []
         payload = json.dumps(cleaner.get_page(), ensure_ascii=False)
         self.assertIn("目录路径", payload)
+        self.assertIn("VChip", payload)
+        self.assertIn("...", payload)
         self.assertIn("/media/down/a", payload)
         self.assertIn("/media/link/a", payload)
 

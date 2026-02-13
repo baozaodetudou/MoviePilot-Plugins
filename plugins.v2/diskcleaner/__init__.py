@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.21"
+    plugin_version = "0.22"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -3504,29 +3504,48 @@ class DiskCleaner(_PluginBase):
         free_percent = float(usage.get("free_percent", 0) or 0)
         free_percent = max(0.0, min(100.0, free_percent))
         progress_color = "error" if trigger else ("success" if enabled else "info")
-        path_preview = [str(item) for item in paths[:10]]
-        path_items = [
+        path_texts = [str(item) for item in paths]
+        path_tooltip_text = "\n".join(path_texts) if path_texts else "无目录路径"
+        path_chip_items = [
+            {
+                "component": "VChip",
+                "props": {
+                    "size": "x-small",
+                    "variant": "outlined",
+                    "color": "primary",
+                    "label": True,
+                    "class": "mr-1 mb-1",
+                    "style": "max-width:100%;",
+                },
+                "text": path,
+            }
+            for path in path_texts
+        ]
+        path_content = [
             {
                 "component": "div",
-                "props": {"class": "text-caption text-medium-emphasis text-truncate"},
-                "text": f"{idx}. {path}",
+                "props": {
+                    "class": "d-flex flex-wrap align-center",
+                    "style": "max-height:72px; overflow:hidden;",
+                    "title": path_tooltip_text,
+                },
+                "content": path_chip_items,
             }
-            for idx, path in enumerate(path_preview, 1)
         ]
-        if not path_items:
-            path_items = [
+        if not path_chip_items:
+            path_content = [
                 {
                     "component": "div",
                     "props": {"class": "text-caption text-medium-emphasis"},
-                    "text": "目录路径：无",
+                    "text": "无目录路径",
                 }
             ]
-        elif len(paths) > len(path_preview):
-            path_items.append(
+        elif len(path_chip_items) > 3:
+            path_content.append(
                 {
                     "component": "div",
-                    "props": {"class": "text-caption text-medium-emphasis"},
-                    "text": f"... 其余 {len(paths) - len(path_preview)} 条目录已省略",
+                    "props": {"class": "text-caption text-medium-emphasis", "title": path_tooltip_text},
+                    "text": "...",
                 }
             )
 
@@ -3587,7 +3606,7 @@ class DiskCleaner(_PluginBase):
                                     "text": f"总 {usage.get('total_text', '0 B')} | 可用 {free_percent:.1f}% | 路径 {len(paths)}",
                                 },
                                 {"component": "div", "props": {"class": "text-caption mt-1 font-weight-bold"}, "text": "目录路径"},
-                                {"component": "div", "props": {"class": "mt-1"}, "content": path_items},
+                                {"component": "div", "props": {"class": "mt-1"}, "content": path_content},
                             ],
                         },
                     ],
