@@ -32,7 +32,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.17"
+    plugin_version = "0.18"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -88,6 +88,7 @@ class DiskCleaner(_PluginBase):
     _media_path_mapping: List[str] = []
     _media_path_rules: List[Tuple[str, str]] = []
     _current_run_freed_bytes = 0
+    _library_scope_filter_notice_logged = False
 
     # 媒体库范围与刷新
     _refresh_mediaserver = False
@@ -428,7 +429,7 @@ class DiskCleaner(_PluginBase):
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
-                        "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "刷新范围复用“媒体库设置”中的媒体服务器与媒体库选择"}}],
+                        "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "媒体目录空间统计与清理始终按本地媒体库目录执行；媒体服务器/媒体库选择仅用于刷新目标"}}],
                     },
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "enable_retry_queue", "label": "启用失败补偿重试"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "retry_max_attempts", "label": "最大重试次数"}}]},
@@ -854,7 +855,7 @@ class DiskCleaner(_PluginBase):
             history_cards = [
                 {
                     "component": "VAlert",
-                    "props": {"type": "info", "variant": "tonal", "density": "comfortable", "text": "暂无任务执行记录"},
+                    "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "暂无任务执行记录"},
                 }
             ]
         else:
@@ -863,67 +864,90 @@ class DiskCleaner(_PluginBase):
                 detail_items = run.get("items") or []
                 detail_content = []
                 if detail_items:
-                    for seq, item in enumerate(detail_items[:12], 1):
-                        detail_content.append({
-                            "component": "VCard",
-                            "props": {"variant": "tonal", "class": "mb-2"},
-                            "content": [
-                                {"component": "VCardText", "props": {"class": "py-1 font-weight-medium"}, "text": f"{seq}. {item.get('trigger', '-')}"},
-                                {"component": "VCardText", "props": {"class": "py-0"}, "text": f"目标：{item.get('target', '-')}"},
-                                {"component": "VCardText", "props": {"class": "py-0"}, "text": f"动作：{item.get('action', '-')}"},
-                                {
-                                    "component": "VCardText",
-                                    "props": {"class": "py-0 text-caption"},
-                                    "text": (
-                                        f"释放：{self._format_size(int(item.get('freed_bytes', 0) or 0))} | "
-                                        f"步骤结果：{self._step_result_text(item.get('steps'))}"
-                                    ),
-                                },
-                            ],
-                        })
-                    if len(detail_items) > 12:
-                        detail_content.append({
-                            "component": "VAlert",
-                            "props": {
-                                "type": "info",
-                                "variant": "tonal",
-                                "density": "compact",
-                                "text": f"本轮明细较多，仅展示前 12 条（共 {len(detail_items)} 条）",
-                            },
-                        })
+                    for seq, item in enumerate(detail_items[:8], 1):
+                        detail_content.append(
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                                "text": (
+                                    f"{seq}. {item.get('trigger', '-')} | {item.get('target', '-')} | "
+                                    f"{item.get('action', '-')} | 释放 {self._format_size(int(item.get('freed_bytes', 0) or 0))} | "
+                                    f"{self._step_result_text(item.get('steps'))}"
+                                ),
+                            }
+                        )
+                    if len(detail_items) > 8:
+                        detail_content.append(
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": f"... 其余 {len(detail_items) - 8} 条明细已折叠",
+                            }
+                        )
                 else:
-                    detail_content.append({
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "density": "compact",
-                            "text": "本轮没有实际删除明细（可能是阈值未命中、冷却命中或仅检查补偿队列）。",
-                        },
-                    })
+                    detail_content.append(
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis"},
+                            "text": "本轮无删除明细（阈值未命中/冷却命中/仅补偿检查）",
+                        }
+                    )
 
                 history_cards.append({
                     "component": "VCard",
-                    "props": {"class": "mb-3", "variant": "outlined"},
+                    "props": {"class": "mb-2", "variant": "tonal"},
                     "content": [
-                        {"component": "VCardTitle", "text": f"第 {index} 轮 | {run.get('time', '-')}", "props": {"class": "text-subtitle-1"}},
-                        {"component": "VCardSubtitle", "text": run.get("flow_text", self._trigger_flow_label())},
-                        {"component": "VDivider"},
                         {
                             "component": "VCardText",
+                            "props": {"class": "py-1 px-2"},
                             "content": [
-                                {"component": "VAlert", "props": {"type": status_type, "variant": "tonal", "density": "compact", "text": f"状态：{status_text} | 备注：{run.get('reason', '-') or '-'}"}},
                                 {
                                     "component": "VRow",
+                                    "props": {"align": "center", "noGutters": True},
                                     "content": [
-                                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCardText", "props": {"class": "pa-0"}, "text": f"处理条目：{int(run.get('action_count', 0) or 0)}"}]},
-                                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCardText", "props": {"class": "pa-0"}, "text": f"释放空间：{self._format_size(int(run.get('freed_bytes', 0) or 0))}"}]},
-                                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCardText", "props": {"class": "pa-0"}, "text": f"模式：{run.get('mode', '-')}"}]},
-                                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCardText", "props": {"class": "pa-0"}, "text": f"触发来源：{','.join(run.get('triggers') or ['-'])}"}]},
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 8},
+                                            "content": [
+                                                {
+                                                    "component": "div",
+                                                    "props": {"class": "text-caption font-weight-bold text-truncate"},
+                                                    "text": f"#{index} {run.get('time', '-')}",
+                                                }
+                                            ],
+                                        },
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 4, "class": "text-right"},
+                                            "content": [
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {"size": "x-small", "color": status_type, "variant": "tonal"},
+                                                    "text": status_text,
+                                                }
+                                            ],
+                                        },
                                     ],
                                 },
-                                {"component": "VCardText", "props": {"class": "px-0 pb-1 font-weight-bold"}, "text": "删除详情"},
-                                {"component": "div", "content": detail_content},
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                                    "text": (
+                                        f"{run.get('flow_text', self._trigger_flow_label())} | "
+                                        f"备注：{run.get('reason', '-') or '-'}"
+                                    ),
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption mt-1 text-truncate"},
+                                    "text": (
+                                        f"处理 {int(run.get('action_count', 0) or 0)} 条 | "
+                                        f"释放 {self._format_size(int(run.get('freed_bytes', 0) or 0))} | "
+                                        f"模式 {run.get('mode', '-')} | "
+                                        f"触发 {','.join(run.get('triggers') or ['-'])}"
+                                    ),
+                                },
+                                {"component": "div", "props": {"class": "mt-1"}, "content": detail_content},
                             ],
                         },
                     ],
@@ -979,10 +1003,10 @@ class DiskCleaner(_PluginBase):
                 "component": "VCard",
                 "props": {"variant": "outlined"},
                 "content": [
-                    {"component": "VCardTitle", "text": "任务执行历史"},
-                    {"component": "VCardSubtitle", "text": "可查看每一轮执行删除了哪些对象、释放了多少空间、步骤是否有失败"},
+                    {"component": "VCardTitle", "text": "任务执行历史（最近10轮）"},
+                    {"component": "VCardSubtitle", "text": "高密度视图：状态/容量/明细"},
                     {"component": "VDivider"},
-                    {"component": "VCardText", "content": history_cards},
+                    {"component": "VCardText", "props": {"class": "py-1 px-2"}, "content": history_cards},
                 ],
             },
         ]
@@ -1236,6 +1260,7 @@ class DiskCleaner(_PluginBase):
 
                 usage = self._collect_monitor_usage()
                 self.save_data("latest_usage", usage)
+                self._log_usage_snapshot(usage=usage, stage="本轮空间检查")
 
                 round_actions: List[dict] = []
                 if not skip_normal_cleanup:
@@ -1317,13 +1342,85 @@ class DiskCleaner(_PluginBase):
             return self._clean_by_transfer_history_oldest(usage=usage)
         return self._clean_by_library_threshold(usage=usage)
 
+    def _usage_summary_text(self, usage: dict, mode: str, value: float) -> str:
+        usage = usage or {}
+        used_percent = float(usage.get("used_percent", 0) or 0)
+        used_percent = max(0.0, min(100.0, used_percent))
+        return (
+            f"总 {usage.get('total_text', '0 B')} | 可用 {usage.get('free_text', '0 B')} | "
+            f"已用 {usage.get('used_text', '0 B')} ({used_percent:.1f}%) | "
+            f"阈值 {self._threshold_text(mode, value)} | 路径 {len(usage.get('paths') or [])}"
+        )
+
+    def _log_usage_snapshot(self, usage: dict, stage: str):
+        download_usage = (usage or {}).get("download", {})
+        library_usage = (usage or {}).get("library", {})
+        if self._monitor_download:
+            download_hit = self._is_threshold_hit(
+                download_usage,
+                self._download_threshold_mode,
+                self._download_threshold_value,
+            )
+            logger.info(
+                f"{self.plugin_name}{stage} 资源目录："
+                f"{self._usage_summary_text(download_usage, self._download_threshold_mode, self._download_threshold_value)} | "
+                f"状态 {'命中阈值' if download_hit else '正常'}"
+            )
+        else:
+            logger.info(f"{self.plugin_name}{stage} 资源目录监听未启用")
+
+        if self._monitor_library:
+            library_hit = self._is_threshold_hit(
+                library_usage,
+                self._library_threshold_mode,
+                self._library_threshold_value,
+            )
+            logger.info(
+                f"{self.plugin_name}{stage} 媒体库目录："
+                f"{self._usage_summary_text(library_usage, self._library_threshold_mode, self._library_threshold_value)} | "
+                f"状态 {'命中阈值' if library_hit else '正常'}"
+            )
+        else:
+            logger.info(f"{self.plugin_name}{stage} 媒体库监听未启用")
+
+    def _log_cleanup_plan(
+        self,
+        trigger: str,
+        target: str,
+        planned_media: int,
+        planned_scrape: int,
+        planned_downloader: int,
+        planned_transfer: int,
+        planned_download: int,
+        freed_bytes: int,
+    ):
+        total_planned = (
+            int(planned_media or 0)
+            + int(planned_scrape or 0)
+            + int(planned_downloader or 0)
+            + int(planned_transfer or 0)
+            + int(planned_download or 0)
+        )
+        if total_planned <= 0 and int(freed_bytes or 0) <= 0:
+            return
+        logger.info(
+            f"{self.plugin_name}开始执行清理计划：触发={trigger} 目标={target} "
+            f"模式={'演练' if self._dry_run else '执行'} | "
+            f"计划 媒体{planned_media} 刮削{planned_scrape} 删种{planned_downloader} "
+            f"整理记录{planned_transfer} 下载记录{planned_download} | "
+            f"预计释放 {self._format_size(int(freed_bytes or 0))}"
+        )
+
     def _clean_by_library_threshold(self, usage: Optional[dict] = None) -> List[dict]:
         usage = usage or self._collect_monitor_usage()
         if not self._monitor_library:
             logger.info(f"{self.plugin_name}流程1未启用媒体库监听，跳过")
             return []
         if not self._is_threshold_hit(usage.get("library", {}), self._library_threshold_mode, self._library_threshold_value):
-            logger.info(f"{self.plugin_name}流程1未命中媒体库阈值，跳过")
+            logger.info(
+                f"{self.plugin_name}流程1未命中媒体库阈值，跳过。"
+                f"{self._usage_summary_text(usage.get('library', {}), self._library_threshold_mode, self._library_threshold_value)}"
+            )
             return []
 
         actions: List[dict] = []
@@ -1357,7 +1454,10 @@ class DiskCleaner(_PluginBase):
             self._download_threshold_value,
         )
         if not download_hit and not self._monitor_downloader:
-            logger.info(f"{self.plugin_name}流程2未命中下载器触发条件，跳过")
+            logger.info(
+                f"{self.plugin_name}流程2未命中下载器触发条件，跳过。"
+                f"{self._usage_summary_text(usage.get('download', {}), self._download_threshold_mode, self._download_threshold_value)}"
+            )
             return []
 
         actions: List[dict] = []
@@ -1395,7 +1495,11 @@ class DiskCleaner(_PluginBase):
         usage = usage or self._collect_monitor_usage()
         reasons = self._flow3_trigger_reasons(usage)
         if not reasons:
-            logger.info(f"{self.plugin_name}流程3未命中触发条件，跳过")
+            logger.info(
+                f"{self.plugin_name}流程3未命中触发条件，跳过。"
+                f"资源目录：{self._usage_summary_text(usage.get('download', {}), self._download_threshold_mode, self._download_threshold_value)}；"
+                f"媒体库目录：{self._usage_summary_text(usage.get('library', {}), self._library_threshold_mode, self._library_threshold_value)}"
+            )
             return []
 
         actions: List[dict] = []
@@ -1443,6 +1547,11 @@ class DiskCleaner(_PluginBase):
             if candidate:
                 reasons.append("下载器做种时长阈值")
         return reasons
+
+    @staticmethod
+    def _is_cleanup_scope_enabled() -> bool:
+        # 2026-02: 清理与空间监控统一改为“全本地媒体库目录”，不再按媒体库选择做路径过滤。
+        return False
 
     def _pick_oldest_transfer_history(self, skipped_ids: set) -> Optional[TransferHistory]:
         records = TransferHistory.list_by_page(
@@ -1503,7 +1612,7 @@ class DiskCleaner(_PluginBase):
             logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
         library_paths = self._library_paths()
         delete_roots = self._media_delete_roots(library_paths)
-        scope_enabled = bool(self._media_servers or self._media_libraries)
+        scope_enabled = self._is_cleanup_scope_enabled()
         if scope_enabled:
             if not media_path or not self._is_path_in_roots(media_path, library_paths):
                 logger.info(f"{self.plugin_name}整理记录不在所选媒体库范围内，跳过：{dest or '-'}")
@@ -1542,6 +1651,17 @@ class DiskCleaner(_PluginBase):
 
         if freed_bytes <= 0 and (planned_downloader + planned_transfer + planned_download) <= 0:
             return None
+
+        self._log_cleanup_plan(
+            trigger=trigger,
+            target=target_text,
+            planned_media=planned_media,
+            planned_scrape=planned_scrape,
+            planned_downloader=planned_downloader,
+            planned_transfer=planned_transfer,
+            planned_download=planned_download,
+            freed_bytes=freed_bytes,
+        )
 
         if not self._dry_run and self._is_run_bytes_limit_reached(freed_bytes):
             logger.info(f"{self.plugin_name}单轮容量上限已达，跳过整理记录：{dest or '-'}")
@@ -1644,7 +1764,7 @@ class DiskCleaner(_PluginBase):
             return None
 
         history = self._find_transfer_history_by_media_path(media_path)
-        scope_enabled = bool(self._media_servers or self._media_libraries)
+        scope_enabled = self._is_cleanup_scope_enabled()
         if history and self._is_history_recent(history):
             logger.info(f"{self.plugin_name}命中近期保护，跳过：{media_path.as_posix()}")
             return None
@@ -1700,6 +1820,17 @@ class DiskCleaner(_PluginBase):
 
         if freed_bytes <= 0 and (planned_downloader + planned_transfer + planned_download) <= 0:
             return None
+
+        self._log_cleanup_plan(
+            trigger=trigger,
+            target=media_path.as_posix(),
+            planned_media=planned_media,
+            planned_scrape=planned_scrape,
+            planned_downloader=planned_downloader,
+            planned_transfer=planned_transfer,
+            planned_download=planned_download,
+            freed_bytes=freed_bytes,
+        )
 
         if not self._dry_run and self._is_run_bytes_limit_reached(freed_bytes):
             logger.info(f"{self.plugin_name}单轮容量上限已达，跳过：{media_path.as_posix()}")
@@ -1806,7 +1937,7 @@ class DiskCleaner(_PluginBase):
             return None
 
         histories = self._transfer_oper.list_by_hash(download_hash) if self._transfer_oper else []
-        scope_enabled = bool(self._media_servers or self._media_libraries)
+        scope_enabled = self._is_cleanup_scope_enabled()
         library_paths = self._library_paths()
         delete_roots = self._media_delete_roots(library_paths)
         download_file_targets = self._download_file_media_paths(download_hash) if self._clean_media_data else []
@@ -1889,6 +2020,17 @@ class DiskCleaner(_PluginBase):
 
         if freed_bytes <= 0 and (planned_downloader + planned_transfer + planned_download) <= 0:
             return None
+
+        self._log_cleanup_plan(
+            trigger=trigger,
+            target=f"{downloader}:{name}",
+            planned_media=planned_media,
+            planned_scrape=planned_scrape,
+            planned_downloader=planned_downloader,
+            planned_transfer=planned_transfer,
+            planned_download=planned_download,
+            freed_bytes=freed_bytes,
+        )
 
         if not self._dry_run and self._is_run_bytes_limit_reached(freed_bytes):
             logger.info(f"{self.plugin_name}单轮容量上限已达，跳过：{downloader}:{name}")
@@ -2261,12 +2403,13 @@ class DiskCleaner(_PluginBase):
         all_library_paths = self._unique_existing_paths(
             [Path(item.library_path) for item in dirs if getattr(item, "library_path", None)]
         )
-        if not self._media_servers and not self._media_libraries:
-            return all_library_paths
-        scope_paths = self._library_scope_paths()
-        if not scope_paths:
-            return []
-        return self._filter_paths_by_scope(all_library_paths, scope_paths)
+        if (self._media_servers or self._media_libraries) and not self._library_scope_filter_notice_logged:
+            logger.info(
+                f"{self.plugin_name}媒体目录空间统计与清理已启用全目录模式，"
+                f"忽略媒体服务器/媒体库路径过滤（该选择仅用于媒体库刷新目标）。"
+            )
+            self._library_scope_filter_notice_logged = True
+        return all_library_paths
 
     def _media_library_items(self, server_filters: Optional[List[str]] = None) -> List[dict]:
         services = MediaServerHelper().get_services(
@@ -2406,18 +2549,7 @@ class DiskCleaner(_PluginBase):
     ) -> List[RefreshMediaItem]:
         if not refresh_items:
             return []
-        if not self._media_servers and not self._media_libraries:
-            return refresh_items
-        library_roots = self._library_paths()
-        if not library_roots:
-            return []
-        filtered: List[RefreshMediaItem] = []
-        for item in refresh_items:
-            target_path = getattr(item, "target_path", None)
-            local_path = self._resolve_local_media_path(target_path)
-            if local_path and self._is_path_in_roots(local_path, library_roots):
-                filtered.append(item)
-        return filtered
+        return refresh_items
 
     @staticmethod
     def _unique_existing_paths(paths: List[Path]) -> List[Path]:
@@ -2519,20 +2651,35 @@ class DiskCleaner(_PluginBase):
         try:
             base = Path(media_path)
             if not base.exists() or not base.is_file() or base.is_symlink():
+                logger.info(f"{self.plugin_name}硬链接扫描跳过：{base.as_posix()}（不存在/非文件/符号链接）")
                 return []
             base_stat = base.stat()
-            if int(getattr(base_stat, "st_nlink", 1) or 1) <= 1:
+            base_links = int(getattr(base_stat, "st_nlink", 1) or 1)
+            if base_links <= 1:
+                logger.info(f"{self.plugin_name}硬链接扫描跳过：{base.as_posix()}（nlink={base_links}）")
                 return []
-        except Exception:
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}硬链接扫描失败，无法读取目标文件：{media_path} err={err}")
             return []
 
-        siblings: Dict[str, Path] = {}
+        active_roots: List[Path] = []
         for root in roots or []:
             try:
-                if not root.exists():
-                    continue
+                if root.exists():
+                    active_roots.append(root)
             except Exception:
                 continue
+        if not active_roots:
+            logger.info(f"{self.plugin_name}硬链接扫描跳过：{base.as_posix()}（无可扫描根目录）")
+            return []
+
+        logger.info(
+            f"{self.plugin_name}硬链接扫描开始：目标={base.as_posix()} "
+            f"nlink={base_links} 根目录={len(active_roots)}"
+        )
+        siblings: Dict[str, Path] = {}
+        scanned_files = 0
+        for root in active_roots:
             for current_root, _, files in os.walk(root.as_posix()):
                 for filename in files:
                     path = Path(current_root) / filename
@@ -2544,8 +2691,13 @@ class DiskCleaner(_PluginBase):
                         stat = path.stat()
                     except Exception:
                         continue
+                    scanned_files += 1
                     if stat.st_ino == base_stat.st_ino and stat.st_dev == base_stat.st_dev:
                         siblings[path.as_posix()] = path
+        logger.info(
+            f"{self.plugin_name}硬链接扫描完成：目标={base.as_posix()} "
+            f"扫描文件={scanned_files} 命中关联文件={len(siblings)}"
+        )
         return list(siblings.values())
 
     def _expand_media_targets_with_hardlinks(
@@ -2573,6 +2725,8 @@ class DiskCleaner(_PluginBase):
                 added_count += 1
         if added_count > 0:
             logger.warning(f"{self.plugin_name}触发硬链接兜底删除，新增 {added_count} 个关联文件：{context}")
+        else:
+            logger.info(f"{self.plugin_name}硬链接兜底扫描未发现新增关联文件：{context}")
         return list(dedup.values())
 
     def _download_file_media_paths(self, download_hash: Optional[str]) -> List[Path]:
@@ -3538,6 +3692,7 @@ class DiskCleaner(_PluginBase):
 
     def _normalize_config(self):
         self._clear_history = bool(self._clear_history)
+        self._library_scope_filter_notice_logged = False
         if self._trigger_flow not in (
             "flow_library_mp_downloader",
             "flow_downloader_mp_library",

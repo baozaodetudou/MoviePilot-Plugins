@@ -76,11 +76,8 @@ D -->|是| E[_cleanup_by_torrent]
 E --> F[按hash查MP整理记录 histories]
 F --> G[提取下载记录文件路径 downloadfiles]
 G --> H[合并目标并做硬链接扩展]
-H --> I{媒体库范围模式且无MP时，目标是否命中所选媒体库?}
-I -->|否| LoopNext[跳过该种子]
-I -->|是| J[执行统一删除步骤]
-J --> C
-LoopNext --> C
+H --> I[执行统一删除步骤]
+I --> C
 ```
 
 关键点：
@@ -98,7 +95,7 @@ B -->|是| C[按date/id从旧到新挑整理记录]
 C --> D{找到候选?}
 D -->|否| End
 D -->|是| E[_cleanup_by_transfer_history]
-E --> F[校验近期保护/电视剧完结/媒体库范围]
+E --> F[校验近期保护/电视剧完结]
 F --> G[构建 media_targets + sidecars]
 G --> H[可选硬链接兜底扩展]
 H --> I[执行统一删除步骤]
@@ -118,10 +115,10 @@ I --> C
 - `monitor_download`：启用下载目录空间阈值触发。
 - `monitor_downloader` + `seeding_days`：启用下载器做种时长触发。
 - `enable_retry_queue`：失败步骤进入补偿队列重试。
+- `media_servers` / `media_libraries`：仅用于媒体库刷新目标选择，不再用于媒体目录空间统计与清理路径过滤。
 
 ## 7. 选择建议
 
 - 常规环境优先选“媒体优先”。
 - 下载器占用明显高、希望从做种任务侧回收，选“下载器优先”。
 - 需要严格按历史最旧记录清理，选“整理记录优先”。
-

@@ -95,6 +95,14 @@ def _install_fake_modules() -> None:
         def get_local_dirs():
             return []
 
+        @staticmethod
+        def get_local_download_dirs():
+            return []
+
+        @staticmethod
+        def get_local_library_dirs():
+            return []
+
     helper_directory_mod.DirectoryHelper = DirectoryHelper
     sys.modules["app.helper.directory"] = helper_directory_mod
 
@@ -278,6 +286,57 @@ class DiskCleanerMockTest(unittest.TestCase):
         payload = json.dumps(form, ensure_ascii=False)
         self.assertIn("USAGE.md", payload)
         self.assertIn("打开使用文档", payload)
+
+    def test_library_paths_ignore_media_scope_filter(self):
+        cleaner = self._new_cleaner()
+        cleaner._media_servers = ["emby"]
+        cleaner._media_libraries = ["emby::1"]
+
+        original_helper = self.plugin_mod.DirectoryHelper
+
+        class _FakeDirectoryHelper:
+            @staticmethod
+            def get_local_library_dirs():
+                return [
+                    SimpleNamespace(library_path="/media/link/电影/"),
+                    SimpleNamespace(library_path="/media/link/电视剧/"),
+                ]
+
+        self.plugin_mod.DirectoryHelper = _FakeDirectoryHelper
+        try:
+            paths = cleaner._library_paths()
+        finally:
+            self.plugin_mod.DirectoryHelper = original_helper
+
+        self.assertEqual(
+            {item.as_posix() for item in paths},
+            {"/media/link/电影", "/media/link/电视剧"},
+        )
+
+    def test_get_page_uses_compact_history_layout(self):
+        cleaner = self._new_cleaner()
+        cleaner._collect_monitor_usage = lambda: {
+            "download": {"paths": [], "total": 0, "free": 0, "used": 0, "used_percent": 0, "free_percent": 0, "total_text": "0 B", "free_text": "0 B", "used_text": "0 B"},
+            "library": {"paths": [], "total": 0, "free": 0, "used": 0, "used_percent": 0, "free_percent": 0, "total_text": "0 B", "free_text": "0 B", "used_text": "0 B"},
+        }
+        cleaner._collect_run_history = lambda: [
+            {
+                "time": "2026-02-13 08:00:00",
+                "status": "completed",
+                "reason": "执行完成",
+                "flow_text": "流程X",
+                "mode": "apply",
+                "action_count": 1,
+                "freed_bytes": 1024,
+                "triggers": ["资源目录阈值"],
+                "items": [{"trigger": "流程X", "target": "/a.mkv", "action": "媒体1", "freed_bytes": 1024, "steps": {}}],
+            }
+        ]
+
+        page = cleaner.get_page()
+        payload = json.dumps(page, ensure_ascii=False)
+        self.assertIn("任务执行历史（最近10轮）", payload)
+        self.assertIn("高密度视图", payload)
 
     def test_cleanup_by_torrent_allow_non_mp_with_downloadfile_hardlink_fallback(self):
         cleaner = self._new_cleaner()
