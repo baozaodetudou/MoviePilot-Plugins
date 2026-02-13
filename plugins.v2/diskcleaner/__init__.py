@@ -32,7 +32,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.18"
+    plugin_version = "0.19"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -89,6 +89,7 @@ class DiskCleaner(_PluginBase):
     _media_path_rules: List[Tuple[str, str]] = []
     _current_run_freed_bytes = 0
     _library_scope_filter_notice_logged = False
+    _last_library_scan_summary = ""
 
     # 媒体库范围与刷新
     _refresh_mediaserver = False
@@ -1223,6 +1224,7 @@ class DiskCleaner(_PluginBase):
                 run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._current_run_freed_bytes = 0
                 self._playback_ts_cache = {}
+                self._last_library_scan_summary = ""
                 retry_actions: List[dict] = []
                 skip_normal_cleanup = False
                 if self._enable_retry_queue and not self._dry_run:
@@ -1346,9 +1348,10 @@ class DiskCleaner(_PluginBase):
         usage = usage or {}
         used_percent = float(usage.get("used_percent", 0) or 0)
         used_percent = max(0.0, min(100.0, used_percent))
+        free_gib = float(usage.get("free", 0) or 0) / (1024 ** 3)
         return (
             f"总 {usage.get('total_text', '0 B')} | 可用 {usage.get('free_text', '0 B')} | "
-            f"已用 {usage.get('used_text', '0 B')} ({used_percent:.1f}%) | "
+            f"(≈{free_gib:.2f} GiB) | 已用 {usage.get('used_text', '0 B')} ({used_percent:.1f}%) | "
             f"阈值 {self._threshold_text(mode, value)} | 路径 {len(usage.get('paths') or [])}"
         )
 
@@ -1411,6 +1414,17 @@ class DiskCleaner(_PluginBase):
             f"预计释放 {self._format_size(int(freed_bytes or 0))}"
         )
 
+    @staticmethod
+    def _paths_preview_text(paths: List[Any], limit: int = 6) -> str:
+        values = [str(item).strip() for item in (paths or []) if str(item).strip()]
+        if not values:
+            return "-"
+        preview = values[: max(1, int(limit or 1))]
+        text = " ; ".join(preview)
+        if len(values) > len(preview):
+            text = f"{text} ; ...(+{len(values) - len(preview)})"
+        return text
+
     def _clean_by_library_threshold(self, usage: Optional[dict] = None) -> List[dict]:
         usage = usage or self._collect_monitor_usage()
         if not self._monitor_library:
@@ -1422,6 +1436,11 @@ class DiskCleaner(_PluginBase):
                 f"{self._usage_summary_text(usage.get('library', {}), self._library_threshold_mode, self._library_threshold_value)}"
             )
             return []
+        library_scan_paths = (usage.get("library", {}) or {}).get("paths") or [item.as_posix() for item in self._library_paths()]
+        logger.info(
+            f"{self.plugin_name}流程1媒体候选扫描目录({len(library_scan_paths)}): "
+            f"{self._paths_preview_text(library_scan_paths)}"
+        )
 
         actions: List[dict] = []
         skipped_paths = set()
@@ -1432,7 +1451,10 @@ class DiskCleaner(_PluginBase):
 
             candidate = self._pick_oldest_library_media(skipped_paths=skipped_paths)
             if not candidate:
-                logger.warning(f"{self.plugin_name}流程1未找到可清理的媒体文件")
+                logger.warning(
+                    f"{self.plugin_name}流程1未找到可清理的媒体文件；"
+                    f"{self._last_library_scan_summary or '无扫描摘要'}"
+                )
                 break
 
             result = self._cleanup_by_media_file(
@@ -2122,32 +2144,54 @@ class DiskCleaner(_PluginBase):
     def _pick_oldest_library_media(self, skipped_paths: Optional[set] = None) -> Optional[dict]:
         library_paths = self._library_paths()
         if not library_paths:
+            self._last_library_scan_summary = "媒体候选扫描结束：未配置可用媒体库目录"
+            logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
             return None
 
         skipped_paths = skipped_paths or set()
         media_exts = {ext.lower() for ext in settings.RMT_MEDIAEXT}
+        logger.info(
+            f"{self.plugin_name}媒体候选扫描开始：目录({len(library_paths)}) "
+            f"{self._paths_preview_text([item.as_posix() for item in library_paths])} | "
+            f"扩展名({len(media_exts)}) {self._paths_preview_text(sorted(media_exts), limit=10)}"
+        )
         candidates: List[dict] = []
         need_history = bool(self._transfer_oper and self._prefer_playback_history)
+        total_roots = len(library_paths)
+        existing_roots = 0
+        scanned_files = 0
+        skipped_non_media = 0
+        skipped_recent = 0
+        skipped_tv_unended = 0
+        skipped_stat_error = 0
+        skipped_by_mark = 0
 
         for root in library_paths:
             if not root.exists():
                 continue
+            existing_roots += 1
 
             for current_root, _, files in os.walk(root.as_posix()):
                 for filename in files:
+                    scanned_files += 1
                     path = Path(current_root) / filename
                     if path.as_posix() in skipped_paths:
+                        skipped_by_mark += 1
                         continue
                     if path.suffix.lower() not in media_exts:
+                        skipped_non_media += 1
                         continue
                     try:
                         stat = path.stat()
                     except Exception:
+                        skipped_stat_error += 1
                         continue
                     history = self._find_transfer_history_by_media_path(path) if need_history else None
                     if history and self._is_history_recent(history):
+                        skipped_recent += 1
                         continue
                     if history and not self._is_tv_cleanup_allowed(history):
+                        skipped_tv_unended += 1
                         continue
                     atime = stat.st_atime or stat.st_mtime
                     candidates.append({
@@ -2158,6 +2202,13 @@ class DiskCleaner(_PluginBase):
                     })
 
         if not candidates:
+            self._last_library_scan_summary = (
+                f"媒体候选扫描结束：未找到可清理媒体文件 | "
+                f"目录 {existing_roots}/{total_roots} | 扫描文件 {scanned_files} | "
+                f"非媒体扩展 {skipped_non_media} | 近期保护 {skipped_recent} | "
+                f"未完结电视剧 {skipped_tv_unended} | 已跳过标记 {skipped_by_mark} | 读取失败 {skipped_stat_error}"
+            )
+            logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
             return None
 
         preferred = [item for item in candidates if item.get("media_type") == self._media_cleanup_priority]
@@ -2175,6 +2226,13 @@ class DiskCleaner(_PluginBase):
                 selected_ts = current_ts
         if not selected:
             return None
+
+        selected_path = selected.get("path")
+        self._last_library_scan_summary = (
+            f"媒体候选扫描完成：候选 {len(candidates)} 条 "
+            f"(优先类型候选 {len(preferred)} 条)，选中 {selected_path.as_posix() if selected_path else '-'}"
+        )
+        logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
 
         return {
             "path": selected.get("path"),
