@@ -338,6 +338,34 @@ class DiskCleanerMockTest(unittest.TestCase):
         self.assertIn("任务执行历史（最近10轮）", payload)
         self.assertIn("高密度视图", payload)
 
+    def test_build_refresh_item_is_json_serializable(self):
+        cleaner = self._new_cleaner()
+        history = SimpleNamespace(
+            type=self.plugin_mod.MediaType.TV,
+            title="示例剧",
+            year=2026,
+            category="国产剧",
+            dest="/media/link/tv/demo.mkv",
+        )
+        item = cleaner._build_refresh_item(history=history, target_path=history.dest)
+        self.assertIsInstance(item, dict)
+        self.assertEqual(item.get("type"), self.plugin_mod.MediaType.TV.value)
+        self.assertEqual(item.get("target_path"), "/media/link/tv/demo.mkv")
+        json.dumps(item, ensure_ascii=False)
+
+    def test_sanitize_for_json_handles_enum_and_path(self):
+        cleaner = self._new_cleaner()
+        raw = {
+            "type": self.plugin_mod.MediaType.MOVIE,
+            "target_path": Path("/media/link/movie.mkv"),
+            "items": [self.plugin_mod.MediaType.TV],
+        }
+        normalized = cleaner._sanitize_for_json(raw)
+        self.assertEqual(normalized.get("type"), self.plugin_mod.MediaType.MOVIE.value)
+        self.assertEqual(normalized.get("target_path"), "/media/link/movie.mkv")
+        self.assertEqual(normalized.get("items"), [self.plugin_mod.MediaType.TV.value])
+        json.dumps(normalized, ensure_ascii=False)
+
     def test_cleanup_by_torrent_allow_non_mp_with_downloadfile_hardlink_fallback(self):
         cleaner = self._new_cleaner()
         cleaner._dry_run = False

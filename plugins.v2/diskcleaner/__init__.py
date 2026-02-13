@@ -3,6 +3,7 @@ import re
 import shutil
 import threading
 import time
+from enum import Enum
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.19"
+    plugin_version = "0.20"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -1156,6 +1157,31 @@ class DiskCleaner(_PluginBase):
             parts.append(f"{label}:{done}/{planned}{'(失败'+str(failed)+')' if failed else ''}")
         return "; ".join(parts) if parts else "-"
 
+    @staticmethod
+    def _sanitize_for_json(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Enum):
+            enum_val = getattr(value, "value", None)
+            if isinstance(enum_val, (str, int, float, bool)) or enum_val is None:
+                return enum_val
+            return str(enum_val)
+        if isinstance(value, Path):
+            return value.as_posix()
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, dict):
+            return {str(k): DiskCleaner._sanitize_for_json(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [DiskCleaner._sanitize_for_json(item) for item in value]
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump(mode="json")
+                return DiskCleaner._sanitize_for_json(dumped)
+            except Exception:
+                return str(value)
+        return str(value)
+
     def _append_run_history(
         self,
         run_time: str,
@@ -1194,8 +1220,8 @@ class DiskCleaner(_PluginBase):
             "usage": usage or {},
             "items": items,
         }
-        run_history.append(run_record)
-        self.save_data("run_history", run_history[-200:])
+        run_history.append(self._sanitize_for_json(run_record))
+        self.save_data("run_history", self._sanitize_for_json(run_history[-200:]))
 
     def get_service(self) -> List[Dict[str, Any]]:
         return []
@@ -1284,7 +1310,7 @@ class DiskCleaner(_PluginBase):
 
                 history = self.get_data("history") or []
                 history.extend(all_actions)
-                self.save_data("history", history[-200:])
+                self.save_data("history", self._sanitize_for_json(history[-200:]))
 
                 freed_bytes = sum(int(item.get("freed_bytes", 0) or 0) for item in all_actions)
                 if not self._dry_run and freed_bytes > 0:
@@ -3360,17 +3386,19 @@ class DiskCleaner(_PluginBase):
         dest = target_path or getattr(history, "dest", None)
         if not mtype or not title or not dest:
             return None
-        try:
-            item = RefreshMediaItem(
-                title=title,
-                year=year,
-                type=mtype,
-                category=category,
-                target_path=Path(dest),
-            )
-            return item.model_dump()
-        except Exception:
+        mtype_text = self._sanitize_for_json(mtype)
+        category_text = self._sanitize_for_json(category)
+        year_text = self._sanitize_for_json(year)
+        dest_text = self._sanitize_for_json(Path(str(dest)))
+        if not mtype_text or not dest_text:
             return None
+        return {
+            "title": str(title),
+            "year": year_text,
+            "type": str(mtype_text),
+            "category": str(category_text) if category_text else None,
+            "target_path": str(dest_text),
+        }
 
     def _refresh_media_servers(self, refresh_items: Optional[List[RefreshMediaItem]] = None) -> int:
         media_servers = self._effective_media_servers()
