@@ -764,6 +764,69 @@ class DiskCleanerMockTest(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_pick_longest_seeding_torrent_supports_case_insensitive_filter(self):
+        cleaner = self._new_cleaner()
+        cleaner._downloaders = ["tr"]
+        original_downloader_helper = self.plugin_mod.DownloaderHelper
+
+        class _TRInstance:
+            @staticmethod
+            def get_completed_torrents():
+                return [{"hash": "h1", "name": "demo", "completion_on": 1}]
+
+        tr_service = SimpleNamespace(instance=_TRInstance())
+
+        class _FakeDownloaderHelper:
+            def get_services(self, name_filters=None):
+                if name_filters is None:
+                    return {"TR": tr_service}
+                if name_filters == ["tr"]:
+                    return {}
+                return {"TR": tr_service} if "TR" in name_filters else {}
+
+        self.plugin_mod.DownloaderHelper = _FakeDownloaderHelper
+        try:
+            result = cleaner._pick_longest_seeding_torrent(min_days=None, skipped_hashes=set())
+        finally:
+            self.plugin_mod.DownloaderHelper = original_downloader_helper
+
+        self.assertIsNotNone(result)
+        self.assertEqual((result or {}).get("downloader"), "TR")
+        self.assertEqual((result or {}).get("hash"), "h1")
+
+    def test_pick_longest_seeding_torrent_logs_summary_when_no_candidate(self):
+        cleaner = self._new_cleaner()
+        cleaner._downloaders = ["tr"]
+        original_downloader_helper = self.plugin_mod.DownloaderHelper
+        original_logger = self.plugin_mod.logger
+        info_logs = []
+
+        class _TRInstance:
+            @staticmethod
+            def get_completed_torrents():
+                return [{"hash": "h1", "name": "demo", "completion_on": 1}]
+
+        class _FakeDownloaderHelper:
+            def get_services(self, name_filters=None):
+                return {"tr": SimpleNamespace(instance=_TRInstance())}
+
+        self.plugin_mod.DownloaderHelper = _FakeDownloaderHelper
+        self.plugin_mod.logger = SimpleNamespace(
+            info=lambda msg, *args, **kwargs: info_logs.append(str(msg)),
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+        )
+        try:
+            result = cleaner._pick_longest_seeding_torrent(min_days=36500, skipped_hashes=set())
+        finally:
+            self.plugin_mod.DownloaderHelper = original_downloader_helper
+            self.plugin_mod.logger = original_logger
+
+        self.assertIsNone(result)
+        self.assertTrue(any("下载器候选扫描无结果" in msg for msg in info_logs))
+        self.assertTrue(any("tr:完成1 可选0" in msg for msg in info_logs))
+
     def test_calc_usage_handles_space_usage_exception(self):
         cleaner = self._new_cleaner()
         usage = cleaner._calc_usage([Path("/tmp/noop")])

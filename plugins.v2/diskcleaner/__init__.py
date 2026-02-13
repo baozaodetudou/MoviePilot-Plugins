@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.23"
+    plugin_version = "0.24"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -2418,39 +2418,86 @@ class DiskCleaner(_PluginBase):
 
     def _pick_longest_seeding_torrent(self, min_days: Optional[int], skipped_hashes: set) -> Optional[dict]:
         name_filters = self._downloaders if self._downloaders else None
+        helper = DownloaderHelper()
+        all_services: Dict[str, Any] = {}
         try:
-            services = DownloaderHelper().get_services(name_filters=name_filters)
+            all_services = helper.get_services() or {}
+            services = helper.get_services(name_filters=name_filters) if name_filters else all_services
         except Exception as err:
             logger.warning(f"{self.plugin_name}获取下载器列表失败：{err}")
+            return None
+
+        if name_filters and not services and all_services:
+            lower_name_map = {name.lower(): name for name in all_services.keys()}
+            normalized_filters = [lower_name_map.get(str(item).lower()) for item in name_filters]
+            normalized_filters = [item for item in normalized_filters if item]
+            if normalized_filters:
+                normalized_set = set(normalized_filters)
+                services = {
+                    name: service
+                    for name, service in all_services.items()
+                    if name in normalized_set
+                }
+                if services:
+                    logger.info(
+                        f"{self.plugin_name}下载器名称已自动纠正（大小写）："
+                        f"{' ; '.join(name_filters)} -> {' ; '.join(sorted(services.keys()))}"
+                    )
+
+        if name_filters and not services:
+            available = sorted(all_services.keys()) if all_services else []
+            logger.warning(
+                f"{self.plugin_name}所选下载器无可用实例：{' ; '.join(name_filters)}"
+                f"{'；当前可用：' + ' ; '.join(available) if available else '；当前没有可用下载器实例'}"
+            )
             return None
         if not services:
             return None
 
         best = None
         min_seconds = int(min_days * 86400) if min_days else 0
+        stats: Dict[str, Dict[str, Any]] = {}
 
         for downloader_name, service in services.items():
+            stats_item = {
+                "total": 0,
+                "invalid_hash": 0,
+                "skip_hash": 0,
+                "below_min": 0,
+                "eligible": 0,
+                "inactive": False,
+                "error": "",
+            }
+            stats[downloader_name] = stats_item
             instance = service.instance
             if not instance:
                 continue
             if hasattr(instance, "is_inactive") and instance.is_inactive():
+                stats_item["inactive"] = True
                 continue
 
             try:
                 torrents = instance.get_completed_torrents() or []
             except Exception as err:
+                stats_item["error"] = str(err)
                 logger.warning(f"{self.plugin_name}读取下载器完成任务失败 {downloader_name}：{err}")
                 continue
+            stats_item["total"] = len(torrents)
             for torrent in torrents:
                 torrent_hash = self._torrent_hash(torrent)
-                if not torrent_hash or torrent_hash in skipped_hashes:
+                if not torrent_hash:
+                    stats_item["invalid_hash"] += 1
                     continue
-
+                if torrent_hash in skipped_hashes:
+                    stats_item["skip_hash"] += 1
+                    continue
 
                 seed_seconds = self._torrent_seed_seconds(torrent)
                 if seed_seconds < min_seconds:
+                    stats_item["below_min"] += 1
                     continue
 
+                stats_item["eligible"] += 1
                 if not best or seed_seconds > best["seed_seconds"]:
                     best = {
                         "downloader": downloader_name,
@@ -2458,6 +2505,27 @@ class DiskCleaner(_PluginBase):
                         "name": self._torrent_name(torrent),
                         "seed_seconds": seed_seconds,
                     }
+
+        if not best:
+            threshold_text = f">= {int(min_days)} 天" if min_days else "不限"
+            detail_parts: List[str] = []
+            for downloader_name in sorted(stats.keys()):
+                item = stats.get(downloader_name) or {}
+                if item.get("error"):
+                    detail_parts.append(f"{downloader_name}:异常={item.get('error')}")
+                    continue
+                if item.get("inactive"):
+                    detail_parts.append(f"{downloader_name}:未激活")
+                    continue
+                detail_parts.append(
+                    f"{downloader_name}:完成{item.get('total', 0)} 可选{item.get('eligible', 0)} "
+                    f"过滤(hash缺失{item.get('invalid_hash', 0)}/已跳过{item.get('skip_hash', 0)}/做种不足{item.get('below_min', 0)})"
+                )
+            logger.info(
+                f"{self.plugin_name}下载器候选扫描无结果：所选下载器"
+                f"{' ; '.join(name_filters) if name_filters else '全部'}，做种阈值 {threshold_text}；"
+                f"{'；'.join(detail_parts) if detail_parts else '无可用统计'}"
+            )
 
         return best
 
