@@ -1129,6 +1129,44 @@ class DiskCleanerMockTest(unittest.TestCase):
         )
         self.assertEqual(cleaner._count_download_records("h1"), 0)
 
+    def test_log_action_details_contains_target_and_reason(self):
+        cleaner = self._new_cleaner()
+        cleaner._dry_run = True
+        original_logger = self.plugin_mod.logger
+        info_logs = []
+        self.plugin_mod.logger = SimpleNamespace(
+            info=lambda msg, *args, **kwargs: info_logs.append(str(msg)),
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+        )
+        try:
+            cleaner._log_action_details(
+                actions=[
+                    {
+                        "trigger": "流程1:媒体目录→优先联动MP整理与下载器",
+                        "target": "/media/tv/Show/Season 01",
+                        "action": "媒体1 刮削0 删种0 整理记录1 下载记录1",
+                        "freed_bytes": 1024,
+                        "steps": {
+                            "media": {"planned": 1, "done": 1, "failed": 0},
+                        },
+                    }
+                ],
+                usage={
+                    "library": {"total": 1, "free": 1, "free_percent": 100},
+                    "download": {"total": 1, "free": 1, "free_percent": 100},
+                },
+            )
+        finally:
+            self.plugin_mod.logger = original_logger
+
+        merged = "\n".join(info_logs)
+        self.assertIn("本轮清理明细开始", merged)
+        self.assertIn("目标=/media/tv/Show/Season 01", merged)
+        self.assertIn("原因=媒体库目录命中阈值", merged)
+        self.assertIn("本轮清理明细结束", merged)
+
 
 if __name__ == "__main__":
     unittest.main()

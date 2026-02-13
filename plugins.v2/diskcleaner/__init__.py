@@ -1158,6 +1158,49 @@ class DiskCleaner(_PluginBase):
             parts.append(f"{label}:{done}/{planned}{'(失败'+str(failed)+')' if failed else ''}")
         return "; ".join(parts) if parts else "-"
 
+    def _action_reason_text(self, action: dict, usage: Optional[dict] = None) -> str:
+        trigger = str((action or {}).get("trigger") or "").strip()
+        if not trigger:
+            return "命中清理规则"
+        if trigger.startswith("失败补偿"):
+            return "前序步骤失败后进入补偿队列重试"
+        if "流程1" in trigger:
+            return (
+                f"媒体库目录命中阈值（{self._threshold_text(self._library_threshold_mode, self._library_threshold_value)}），"
+                "按最旧媒体候选清理"
+            )
+        if "流程2" in trigger:
+            if "做种阈值" in trigger:
+                return f"下载器做种时长达到阈值（{self._seeding_days} 天）"
+            return (
+                f"资源目录命中阈值（{self._threshold_text(self._download_threshold_mode, self._download_threshold_value)}），"
+                "按下载器候选清理"
+            )
+        if "流程3" in trigger:
+            reasons = self._flow3_trigger_reasons(usage or {}) if usage else []
+            if reasons:
+                return f"触发条件：{'/'.join(reasons)}；按整理记录从旧到新清理"
+            return "按整理记录从旧到新清理"
+        return trigger
+
+    def _log_action_details(self, actions: List[dict], usage: Optional[dict]):
+        if not actions:
+            return
+        logger.info(f"{self.plugin_name}本轮清理明细开始（共 {len(actions)} 条）")
+        mode_text = "预计" if self._dry_run else "实际"
+        for index, item in enumerate(actions, 1):
+            reason_text = self._action_reason_text(item, usage=usage)
+            logger.info(
+                f"{self.plugin_name}清理明细[{index}/{len(actions)}] "
+                f"目标={item.get('target') or '-'} | "
+                f"原因={reason_text} | "
+                f"触发={item.get('trigger') or '-'} | "
+                f"执行={item.get('action') or '-'} | "
+                f"步骤={self._step_result_text(item.get('steps'))} | "
+                f"{mode_text}释放={self._format_size(int(item.get('freed_bytes', 0) or 0))}"
+            )
+        logger.info(f"{self.plugin_name}本轮清理明细结束")
+
     @staticmethod
     def _sanitize_for_json(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -1344,6 +1387,7 @@ class DiskCleaner(_PluginBase):
                     status="completed",
                     reason="执行完成",
                 )
+                self._log_action_details(actions=all_actions, usage=usage)
                 self.save_data("last_run_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 logger.info(
                     f"{self.plugin_name}执行完成，本次处理 {len(all_actions)} 条，"
