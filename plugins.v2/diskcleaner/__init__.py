@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.26"
+    plugin_version = "0.27"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -91,6 +91,7 @@ class DiskCleaner(_PluginBase):
     _current_run_freed_bytes = 0
     _library_scope_filter_notice_logged = False
     _last_library_scan_summary = ""
+    _last_library_scan_stats: Dict[str, int] = {}
 
     # 媒体库范围与刷新
     _refresh_mediaserver = False
@@ -123,6 +124,7 @@ class DiskCleaner(_PluginBase):
         self._playback_ts_cache = {}
         self._tv_end_state_cache = {}
         self._library_scope_cache = None
+        self._last_library_scan_stats = {}
 
         if config:
             self._enabled = bool(config.get("enabled", False))
@@ -1250,6 +1252,7 @@ class DiskCleaner(_PluginBase):
                 self._current_run_freed_bytes = 0
                 self._playback_ts_cache = {}
                 self._last_library_scan_summary = ""
+                self._last_library_scan_stats = {}
                 retry_actions: List[dict] = []
                 skip_normal_cleanup = False
                 if self._enable_retry_queue and not self._dry_run:
@@ -1507,6 +1510,9 @@ class DiskCleaner(_PluginBase):
             )
             return []
 
+        overview_min_days = self._seeding_days if self._monitor_downloader else None
+        self._log_downloader_overview_stats(min_days=overview_min_days, skipped_hashes=set())
+
         actions: List[dict] = []
         skipped_hashes = set()
         while not self._is_run_limit_reached(actions):
@@ -1608,6 +1614,7 @@ class DiskCleaner(_PluginBase):
             status=True,
         ) or []
         if not records:
+            logger.info(f"{self.plugin_name}流程3整理记录统计：总0 符合条件0")
             return None
 
         def _sort_key(item: TransferHistory) -> Tuple[int, int]:
@@ -1616,17 +1623,30 @@ class DiskCleaner(_PluginBase):
             return date_ts, item_id
 
         candidates: List[TransferHistory] = []
+        skipped_mark = 0
+        skipped_recent = 0
+        skipped_tv_unended = 0
+        skipped_no_target = 0
         for history in sorted(records, key=_sort_key):
             hid = int(getattr(history, "id", 0) or 0)
             if hid > 0 and hid in skipped_ids:
+                skipped_mark += 1
                 continue
             if self._is_history_recent(history):
+                skipped_recent += 1
                 continue
             if not self._is_tv_cleanup_allowed(history):
+                skipped_tv_unended += 1
                 continue
             if not getattr(history, "dest", None) and not getattr(history, "download_hash", None):
+                skipped_no_target += 1
                 continue
             candidates.append(history)
+        logger.info(
+            f"{self.plugin_name}流程3整理记录统计：总{len(records)} 符合条件{len(candidates)} | "
+            f"近期保护{skipped_recent} 未完结{skipped_tv_unended} "
+            f"无目标{skipped_no_target} 已跳过{skipped_mark}"
+        )
         if not candidates:
             return None
         preferred = [item for item in candidates if self._history_media_type_key(item) == self._media_cleanup_priority]
@@ -2186,6 +2206,7 @@ class DiskCleaner(_PluginBase):
         existing_roots = 0
         scanned_files = 0
         skipped_non_media = 0
+        matched_media_ext = 0
         skipped_recent = 0
         skipped_tv_unended = 0
         skipped_stat_error = 0
@@ -2206,6 +2227,7 @@ class DiskCleaner(_PluginBase):
                     if path.suffix.lower() not in media_exts:
                         skipped_non_media += 1
                         continue
+                    matched_media_ext += 1
                     try:
                         stat = path.stat()
                     except Exception:
@@ -2227,11 +2249,27 @@ class DiskCleaner(_PluginBase):
                     })
 
         if not candidates:
+            self._last_library_scan_stats = {
+                "roots_total": total_roots,
+                "roots_existing": existing_roots,
+                "files_total": scanned_files,
+                "media_files": matched_media_ext,
+                "eligible": 0,
+                "filtered_recent": skipped_recent,
+                "filtered_tv_unended": skipped_tv_unended,
+                "filtered_marked": skipped_by_mark,
+                "filtered_stat_error": skipped_stat_error,
+                "filtered_non_media": skipped_non_media,
+            }
             self._last_library_scan_summary = (
                 f"媒体候选扫描结束：未找到可清理媒体文件 | "
                 f"目录 {existing_roots}/{total_roots} | 扫描文件 {scanned_files} | "
-                f"非媒体扩展 {skipped_non_media} | 近期保护 {skipped_recent} | "
+                f"媒体文件 {matched_media_ext} | 非媒体扩展 {skipped_non_media} | 近期保护 {skipped_recent} | "
                 f"未完结电视剧 {skipped_tv_unended} | 已跳过标记 {skipped_by_mark} | 读取失败 {skipped_stat_error}"
+            )
+            logger.info(
+                f"{self.plugin_name}流程1媒体库任务统计：总文件{scanned_files} 媒体文件{matched_media_ext} "
+                f"符合条件0 | 近期保护{skipped_recent} 未完结{skipped_tv_unended} 已跳过{skipped_by_mark}"
             )
             logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
             return None
@@ -2253,9 +2291,26 @@ class DiskCleaner(_PluginBase):
             return None
 
         selected_path = selected.get("path")
+        self._last_library_scan_stats = {
+            "roots_total": total_roots,
+            "roots_existing": existing_roots,
+            "files_total": scanned_files,
+            "media_files": matched_media_ext,
+            "eligible": len(candidates),
+            "filtered_recent": skipped_recent,
+            "filtered_tv_unended": skipped_tv_unended,
+            "filtered_marked": skipped_by_mark,
+            "filtered_stat_error": skipped_stat_error,
+            "filtered_non_media": skipped_non_media,
+        }
         self._last_library_scan_summary = (
             f"媒体候选扫描完成：候选 {len(candidates)} 条 "
-            f"(优先类型候选 {len(preferred)} 条)，选中 {selected_path.as_posix() if selected_path else '-'}"
+            f"(优先类型候选 {len(preferred)} 条)，选中 {selected_path.as_posix() if selected_path else '-'} | "
+            f"扫描文件 {scanned_files} 媒体文件 {matched_media_ext}"
+        )
+        logger.info(
+            f"{self.plugin_name}流程1媒体库任务统计：总文件{scanned_files} 媒体文件{matched_media_ext} "
+            f"符合条件{len(candidates)} | 近期保护{skipped_recent} 未完结{skipped_tv_unended} 已跳过{skipped_by_mark}"
         )
         logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
 
@@ -2418,39 +2473,7 @@ class DiskCleaner(_PluginBase):
 
     def _pick_longest_seeding_torrent(self, min_days: Optional[int], skipped_hashes: set) -> Optional[dict]:
         name_filters = self._downloaders if self._downloaders else None
-        helper = DownloaderHelper()
-        all_services: Dict[str, Any] = {}
-        try:
-            all_services = helper.get_services() or {}
-            services = helper.get_services(name_filters=name_filters) if name_filters else all_services
-        except Exception as err:
-            logger.warning(f"{self.plugin_name}获取下载器列表失败：{err}")
-            return None
-
-        if name_filters and not services and all_services:
-            lower_name_map = {name.lower(): name for name in all_services.keys()}
-            normalized_filters = [lower_name_map.get(str(item).lower()) for item in name_filters]
-            normalized_filters = [item for item in normalized_filters if item]
-            if normalized_filters:
-                normalized_set = set(normalized_filters)
-                services = {
-                    name: service
-                    for name, service in all_services.items()
-                    if name in normalized_set
-                }
-                if services:
-                    logger.info(
-                        f"{self.plugin_name}下载器名称已自动纠正（大小写）："
-                        f"{' ; '.join(name_filters)} -> {' ; '.join(sorted(services.keys()))}"
-                    )
-
-        if name_filters and not services:
-            available = sorted(all_services.keys()) if all_services else []
-            logger.warning(
-                f"{self.plugin_name}所选下载器无可用实例：{' ; '.join(name_filters)}"
-                f"{'；当前可用：' + ' ; '.join(available) if available else '；当前没有可用下载器实例'}"
-            )
-            return None
+        services = self._resolve_downloader_services(name_filters=name_filters)
         if not services:
             return None
 
@@ -2530,6 +2553,42 @@ class DiskCleaner(_PluginBase):
 
         return best
 
+    def _resolve_downloader_services(self, name_filters: Optional[List[str]]) -> Dict[str, Any]:
+        helper = DownloaderHelper()
+        all_services: Dict[str, Any] = {}
+        try:
+            all_services = helper.get_services() or {}
+            services = helper.get_services(name_filters=name_filters) if name_filters else all_services
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取下载器列表失败：{err}")
+            return {}
+
+        if name_filters and not services and all_services:
+            lower_name_map = {name.lower(): name for name in all_services.keys()}
+            normalized_filters = [lower_name_map.get(str(item).lower()) for item in name_filters]
+            normalized_filters = [item for item in normalized_filters if item]
+            if normalized_filters:
+                normalized_set = set(normalized_filters)
+                services = {
+                    name: service
+                    for name, service in all_services.items()
+                    if name in normalized_set
+                }
+                if services:
+                    logger.info(
+                        f"{self.plugin_name}下载器名称已自动纠正（大小写）："
+                        f"{' ; '.join(name_filters)} -> {' ; '.join(sorted(services.keys()))}"
+                    )
+
+        if name_filters and not services:
+            available = sorted(all_services.keys()) if all_services else []
+            logger.warning(
+                f"{self.plugin_name}所选下载器无可用实例：{' ; '.join(name_filters)}"
+                f"{'；当前可用：' + ' ; '.join(available) if available else '；当前没有可用下载器实例'}"
+            )
+            return {}
+        return services or {}
+
     @staticmethod
     def _parse_torrent_list_result(result: Any) -> Optional[List[Any]]:
         if result is None:
@@ -2545,6 +2604,18 @@ class DiskCleaner(_PluginBase):
         if isinstance(result, list):
             return result
         return None
+
+    def _safe_list_torrents(self, instance: Any, status: Any = None) -> Optional[List[Any]]:
+        if not hasattr(instance, "get_torrents"):
+            return None
+        try:
+            if status is None:
+                result = instance.get_torrents()
+            else:
+                result = instance.get_torrents(status=status)
+        except Exception:
+            return None
+        return self._parse_torrent_list_result(result)
 
     def _list_completed_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
         # 统一口径：已完成任务应包含“暂停但已完成”的种子。
@@ -2562,6 +2633,111 @@ class DiskCleaner(_PluginBase):
         if hasattr(instance, "get_completed_torrents"):
             return list(instance.get_completed_torrents() or [])
         return []
+
+    def _list_downloading_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
+        if hasattr(instance, "get_downloading_torrents"):
+            try:
+                return list(instance.get_downloading_torrents() or [])
+            except Exception:
+                pass
+        if service_type == "transmission":
+            return self._safe_list_torrents(instance=instance, status=["downloading", "download_pending"]) or []
+        return self._safe_list_torrents(instance=instance, status="downloading") or []
+
+    def _list_paused_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
+        if service_type == "transmission":
+            return self._safe_list_torrents(instance=instance, status=["stopped"]) or []
+        return self._safe_list_torrents(instance=instance, status="paused") or []
+
+    def _collect_downloader_overview_stats(self, min_days: Optional[int], skipped_hashes: set) -> Tuple[dict, List[dict]]:
+        services = self._resolve_downloader_services(name_filters=self._downloaders if self._downloaders else None)
+        summary = {"total": 0, "completed": 0, "downloading": 0, "paused": 0, "eligible": 0}
+        details: List[dict] = []
+        if not services:
+            return summary, details
+
+        min_seconds = int(min_days * 86400) if min_days else 0
+        for downloader_name, service in services.items():
+            item = {
+                "name": downloader_name,
+                "total": 0,
+                "completed": 0,
+                "downloading": 0,
+                "paused": 0,
+                "eligible": 0,
+                "inactive": False,
+                "error": "",
+            }
+            details.append(item)
+            instance = getattr(service, "instance", None)
+            if not instance:
+                continue
+            if hasattr(instance, "is_inactive") and instance.is_inactive():
+                item["inactive"] = True
+                continue
+            service_type = str(getattr(service, "type", "") or "").strip().lower()
+            try:
+                completed = self._list_completed_torrents_for_cleanup(instance=instance, service_type=service_type)
+                downloading = self._list_downloading_torrents_for_cleanup(instance=instance, service_type=service_type)
+                paused = self._list_paused_torrents_for_cleanup(instance=instance, service_type=service_type)
+                total = self._safe_list_torrents(instance=instance) or []
+            except Exception as err:
+                item["error"] = str(err)
+                continue
+
+            item["completed"] = len(completed)
+            item["downloading"] = len(downloading)
+            item["paused"] = len(paused)
+            item["total"] = len(total)
+            if item["total"] <= 0:
+                hashes = set()
+                for torrent in (completed + downloading + paused):
+                    torrent_hash = self._torrent_hash(torrent)
+                    if torrent_hash:
+                        hashes.add(torrent_hash)
+                item["total"] = len(hashes) or (len(completed) + len(downloading) + len(paused))
+
+            eligible = 0
+            for torrent in completed:
+                torrent_hash = self._torrent_hash(torrent)
+                if not torrent_hash or torrent_hash in skipped_hashes:
+                    continue
+                if self._torrent_seed_seconds(torrent) < min_seconds:
+                    continue
+                eligible += 1
+            item["eligible"] = eligible
+
+            summary["total"] += item["total"]
+            summary["completed"] += item["completed"]
+            summary["downloading"] += item["downloading"]
+            summary["paused"] += item["paused"]
+            summary["eligible"] += item["eligible"]
+        return summary, details
+
+    def _log_downloader_overview_stats(self, min_days: Optional[int], skipped_hashes: set):
+        summary, details = self._collect_downloader_overview_stats(min_days=min_days, skipped_hashes=skipped_hashes)
+        threshold_text = f">= {int(min_days)} 天" if min_days else "不限"
+        if not details:
+            logger.info(f"{self.plugin_name}流程2下载器任务统计：无可用下载器实例")
+            return
+        detail_text_parts: List[str] = []
+        for item in details:
+            if item.get("error"):
+                detail_text_parts.append(f"{item.get('name')}:异常={item.get('error')}")
+                continue
+            if item.get("inactive"):
+                detail_text_parts.append(f"{item.get('name')}:未激活")
+                continue
+            detail_text_parts.append(
+                f"{item.get('name')}(总{item.get('total', 0)} 完成{item.get('completed', 0)} "
+                f"下载中{item.get('downloading', 0)} 暂停{item.get('paused', 0)} 符合{item.get('eligible', 0)})"
+            )
+        logger.info(
+            f"{self.plugin_name}流程2下载器任务统计：总{summary.get('total', 0)} 完成{summary.get('completed', 0)} "
+            f"下载中{summary.get('downloading', 0)} 暂停{summary.get('paused', 0)} "
+            f"符合条件{summary.get('eligible', 0)} | 做种阈值 {threshold_text} | "
+            f"{' ; '.join(detail_text_parts)}"
+        )
 
     def _collect_monitor_usage(self) -> dict:
         return {

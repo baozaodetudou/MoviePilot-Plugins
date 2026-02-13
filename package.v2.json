@@ -50,12 +50,13 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
-        "version": "0.26",
+        "version": "0.27",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
         "level": 1,
         "history": {
+            "v0.27": "增强任务统计日志：新增下载器/媒体库/整理记录三类总览统计（总数、状态分布、符合条件与过滤原因），便于快速排查为何未命中清理。",
             "v0.26": "下载器候选口径统一：已完成任务不区分暂停与否均参与清理（qb包含completed，TR包含seeding/seed_pending/stopped）；补充对应回归测试。",
             "v0.25": "修复Transmission候选识别：兼容 hashString/hash_string 与 doneDate/date_done 字段提取，避免已完成任务被误判为hash缺失；补充对应回归测试。",
             "v0.24": "下载器优先稳定性增强：下载器名称过滤支持大小写自动纠正；无候选时新增按下载器扫描摘要日志（完成数/可选数/过滤原因），便于定位仅选TR等场景为何未命中。",

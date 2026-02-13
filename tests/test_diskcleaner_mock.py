@@ -912,6 +912,74 @@ class DiskCleanerMockTest(unittest.TestCase):
         self.assertEqual((result or {}).get("hash"), "t1")
         self.assertEqual((result or {}).get("downloader"), "TR")
 
+    def test_collect_downloader_overview_stats_contains_total_completed_downloading_paused_and_eligible(self):
+        cleaner = self._new_cleaner()
+        cleaner._downloaders = ["qb"]
+        original_downloader_helper = self.plugin_mod.DownloaderHelper
+
+        class _QBInstance:
+            @staticmethod
+            def get_torrents(status=None, ids=None, tags=None):
+                if status is None:
+                    return ([{"hash": "h1"}, {"hash": "h2"}, {"hash": "h3"}, {"hash": "h4"}, {"hash": "h5"}], False)
+                if status == "completed":
+                    return ([{"hash": "h1", "completion_on": 1}, {"hash": "h2", "completion_on": 2}, {"hash": "h3", "completion_on": 3}], False)
+                if status == "downloading":
+                    return ([{"hash": "h4"}], False)
+                if status == "paused":
+                    return ([{"hash": "h5"}], False)
+                return ([], False)
+
+            @staticmethod
+            def get_downloading_torrents():
+                return [{"hash": "h4"}]
+
+            @staticmethod
+            def get_completed_torrents():
+                return [{"hash": "h1", "completion_on": 1}, {"hash": "h2", "completion_on": 2}, {"hash": "h3", "completion_on": 3}]
+
+        class _FakeDownloaderHelper:
+            def get_services(self, name_filters=None):
+                return {"qb": SimpleNamespace(instance=_QBInstance(), type="qbittorrent")}
+
+        self.plugin_mod.DownloaderHelper = _FakeDownloaderHelper
+        try:
+            summary, details = cleaner._collect_downloader_overview_stats(min_days=None, skipped_hashes=set())
+        finally:
+            self.plugin_mod.DownloaderHelper = original_downloader_helper
+
+        self.assertEqual(summary.get("total"), 5)
+        self.assertEqual(summary.get("completed"), 3)
+        self.assertEqual(summary.get("downloading"), 1)
+        self.assertEqual(summary.get("paused"), 1)
+        self.assertEqual(summary.get("eligible"), 3)
+        self.assertTrue(details)
+        self.assertEqual((details[0] or {}).get("name"), "qb")
+
+    def test_log_downloader_overview_stats_prints_compact_summary(self):
+        cleaner = self._new_cleaner()
+        original_collect = cleaner._collect_downloader_overview_stats
+        original_logger = self.plugin_mod.logger
+        info_logs = []
+
+        cleaner._collect_downloader_overview_stats = lambda min_days, skipped_hashes: (
+            {"total": 5, "completed": 3, "downloading": 1, "paused": 1, "eligible": 2},
+            [{"name": "TR", "total": 5, "completed": 3, "downloading": 1, "paused": 1, "eligible": 2}],
+        )
+        self.plugin_mod.logger = SimpleNamespace(
+            info=lambda msg, *args, **kwargs: info_logs.append(str(msg)),
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+        )
+        try:
+            cleaner._log_downloader_overview_stats(min_days=None, skipped_hashes=set())
+        finally:
+            cleaner._collect_downloader_overview_stats = original_collect
+            self.plugin_mod.logger = original_logger
+
+        self.assertTrue(any("流程2下载器任务统计：总5 完成3 下载中1 暂停1 符合条件2" in msg for msg in info_logs))
+
     def test_calc_usage_handles_space_usage_exception(self):
         cleaner = self._new_cleaner()
         usage = cleaner._calc_usage([Path("/tmp/noop")])
