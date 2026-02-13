@@ -921,7 +921,13 @@ class DiskCleanerMockTest(unittest.TestCase):
             @staticmethod
             def get_torrents(status=None, ids=None, tags=None):
                 if status is None:
-                    return ([{"hash": "h1"}, {"hash": "h2"}, {"hash": "h3"}, {"hash": "h4"}, {"hash": "h5"}], False)
+                    return ([
+                        {"hash": "h1", "state": "uploading", "progress": 1},
+                        {"hash": "h2", "state": "uploading", "progress": 1},
+                        {"hash": "h3", "state": "uploading", "progress": 1},
+                        {"hash": "h4", "state": "downloading", "progress": 0.5},
+                        {"hash": "h5", "state": "pausedDL", "progress": 0.2},
+                    ], False)
                 if status == "completed":
                     return ([{"hash": "h1", "completion_on": 1}, {"hash": "h2", "completion_on": 2}, {"hash": "h3", "completion_on": 3}], False)
                 if status == "downloading":

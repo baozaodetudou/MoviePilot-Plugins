@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.27"
+    plugin_version = "0.28"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -2677,28 +2677,35 @@ class DiskCleaner(_PluginBase):
                 continue
             service_type = str(getattr(service, "type", "") or "").strip().lower()
             try:
-                completed = self._list_completed_torrents_for_cleanup(instance=instance, service_type=service_type)
-                downloading = self._list_downloading_torrents_for_cleanup(instance=instance, service_type=service_type)
-                paused = self._list_paused_torrents_for_cleanup(instance=instance, service_type=service_type)
                 total = self._safe_list_torrents(instance=instance) or []
             except Exception as err:
                 item["error"] = str(err)
                 continue
 
-            item["completed"] = len(completed)
-            item["downloading"] = len(downloading)
-            item["paused"] = len(paused)
             item["total"] = len(total)
             if item["total"] <= 0:
-                hashes = set()
-                for torrent in (completed + downloading + paused):
+                completed_fallback = self._list_completed_torrents_for_cleanup(instance=instance, service_type=service_type)
+                downloading_fallback = self._list_downloading_torrents_for_cleanup(instance=instance, service_type=service_type)
+                paused_fallback = self._list_paused_torrents_for_cleanup(instance=instance, service_type=service_type)
+                merged = completed_fallback + downloading_fallback + paused_fallback
+                dedup: Dict[str, Any] = {}
+                for torrent in merged:
                     torrent_hash = self._torrent_hash(torrent)
                     if torrent_hash:
-                        hashes.add(torrent_hash)
-                item["total"] = len(hashes) or (len(completed) + len(downloading) + len(paused))
+                        dedup[torrent_hash] = torrent
+                total = list(dedup.values()) if dedup else merged
+                item["total"] = len(total)
+
+            completed_candidates: List[Any] = []
+            for torrent in total:
+                if self._is_torrent_completed(torrent):
+                    completed_candidates.append(torrent)
+            item["completed"] = len(completed_candidates)
+            item["downloading"] = len([torrent for torrent in total if self._is_torrent_downloading(torrent)])
+            item["paused"] = len([torrent for torrent in total if self._is_torrent_paused(torrent)])
 
             eligible = 0
-            for torrent in completed:
+            for torrent in completed_candidates:
                 torrent_hash = self._torrent_hash(torrent)
                 if not torrent_hash or torrent_hash in skipped_hashes:
                     continue
@@ -3776,6 +3783,74 @@ class DiskCleaner(_PluginBase):
                 return max(0, now - completed)
 
         return 0
+
+    @staticmethod
+    def _torrent_state_text(torrent: Any) -> str:
+        value = None
+        if hasattr(torrent, "get"):
+            try:
+                value = torrent.get("state") or torrent.get("status")
+            except Exception:
+                value = None
+        if value is None:
+            value = getattr(torrent, "state", None) or getattr(torrent, "status", None)
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _torrent_progress_percent(torrent: Any) -> float:
+        value = None
+        if hasattr(torrent, "get"):
+            try:
+                value = (
+                    torrent.get("progress")
+                    or torrent.get("percentDone")
+                    or torrent.get("percent_done")
+                )
+            except Exception:
+                value = None
+        if value is None:
+            value = (
+                getattr(torrent, "progress", None)
+                or getattr(torrent, "percentDone", None)
+                or getattr(torrent, "percent_done", None)
+                or getattr(torrent, "percent_done", None)
+            )
+        try:
+            number = float(value)
+        except Exception:
+            return 0.0
+        if number <= 1.001:
+            return max(0.0, min(100.0, number * 100.0))
+        return max(0.0, min(100.0, number))
+
+    def _is_torrent_paused(self, torrent: Any) -> bool:
+        state = self._torrent_state_text(torrent)
+        if not state:
+            return False
+        return state.startswith("paused") or state == "stopped"
+
+    def _is_torrent_downloading(self, torrent: Any) -> bool:
+        state = self._torrent_state_text(torrent)
+        if not state:
+            return False
+        downloading_states = {
+            "downloading", "download_pending", "checking", "check_pending",
+            "metadl", "forceddl", "stalleddl", "queueddl",
+        }
+        return state in downloading_states
+
+    def _is_torrent_completed(self, torrent: Any) -> bool:
+        if self._torrent_progress_percent(torrent) >= 99.9:
+            return True
+        state = self._torrent_state_text(torrent)
+        completed_states = {
+            "seeding", "seed_pending", "uploading", "stalledup",
+            "queuedup", "forcedup", "pausedup", "stopped",
+            "completed", "complete",
+        }
+        if state in completed_states:
+            return True
+        return self._torrent_seed_seconds(torrent) > 0
 
     @staticmethod
     def _format_size(size: float) -> str:
