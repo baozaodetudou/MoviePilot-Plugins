@@ -850,6 +850,68 @@ class DiskCleanerMockTest(unittest.TestCase):
         finally:
             self.plugin_mod.time.time = original_time
 
+    def test_pick_longest_seeding_torrent_qb_includes_completed_status(self):
+        cleaner = self._new_cleaner()
+        cleaner._downloaders = ["qb"]
+        original_downloader_helper = self.plugin_mod.DownloaderHelper
+
+        calls = {"status": None}
+
+        class _QBInstance:
+            @staticmethod
+            def get_torrents(status=None, ids=None, tags=None):
+                calls["status"] = status
+                return ([{"hash": "q1", "name": "qb-demo", "completion_on": 1}], False)
+
+            @staticmethod
+            def get_completed_torrents():
+                return []
+
+        class _FakeDownloaderHelper:
+            def get_services(self, name_filters=None):
+                return {"qb": SimpleNamespace(instance=_QBInstance(), type="qbittorrent")}
+
+        self.plugin_mod.DownloaderHelper = _FakeDownloaderHelper
+        try:
+            result = cleaner._pick_longest_seeding_torrent(min_days=None, skipped_hashes=set())
+        finally:
+            self.plugin_mod.DownloaderHelper = original_downloader_helper
+
+        self.assertEqual(calls["status"], "completed")
+        self.assertEqual((result or {}).get("hash"), "q1")
+        self.assertEqual((result or {}).get("downloader"), "qb")
+
+    def test_pick_longest_seeding_torrent_tr_includes_stopped_completed(self):
+        cleaner = self._new_cleaner()
+        cleaner._downloaders = ["TR"]
+        original_downloader_helper = self.plugin_mod.DownloaderHelper
+
+        calls = {"status": None}
+
+        class _TRInstance:
+            @staticmethod
+            def get_torrents(status=None, ids=None, tags=None):
+                calls["status"] = status
+                return ([{"hashString": "t1", "name": "tr-demo", "doneDate": 1}], False)
+
+            @staticmethod
+            def get_completed_torrents():
+                return []
+
+        class _FakeDownloaderHelper:
+            def get_services(self, name_filters=None):
+                return {"TR": SimpleNamespace(instance=_TRInstance(), type="transmission")}
+
+        self.plugin_mod.DownloaderHelper = _FakeDownloaderHelper
+        try:
+            result = cleaner._pick_longest_seeding_torrent(min_days=None, skipped_hashes=set())
+        finally:
+            self.plugin_mod.DownloaderHelper = original_downloader_helper
+
+        self.assertEqual(calls["status"], ["seeding", "seed_pending", "stopped"])
+        self.assertEqual((result or {}).get("hash"), "t1")
+        self.assertEqual((result or {}).get("downloader"), "TR")
+
     def test_calc_usage_handles_space_usage_exception(self):
         cleaner = self._new_cleaner()
         usage = cleaner._calc_usage([Path("/tmp/noop")])

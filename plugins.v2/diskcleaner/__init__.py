@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.25"
+    plugin_version = "0.26"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -2477,7 +2477,8 @@ class DiskCleaner(_PluginBase):
                 continue
 
             try:
-                torrents = instance.get_completed_torrents() or []
+                service_type = str(getattr(service, "type", "") or "").strip().lower()
+                torrents = self._list_completed_torrents_for_cleanup(instance=instance, service_type=service_type)
             except Exception as err:
                 stats_item["error"] = str(err)
                 logger.warning(f"{self.plugin_name}读取下载器完成任务失败 {downloader_name}：{err}")
@@ -2528,6 +2529,39 @@ class DiskCleaner(_PluginBase):
             )
 
         return best
+
+    @staticmethod
+    def _parse_torrent_list_result(result: Any) -> Optional[List[Any]]:
+        if result is None:
+            return []
+        if isinstance(result, tuple):
+            if not result:
+                return []
+            torrents = result[0] if len(result) >= 1 else []
+            error = bool(result[1]) if len(result) >= 2 else False
+            if error:
+                return None
+            return list(torrents or [])
+        if isinstance(result, list):
+            return result
+        return None
+
+    def _list_completed_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
+        # 统一口径：已完成任务应包含“暂停但已完成”的种子。
+        if hasattr(instance, "get_torrents"):
+            result: Any = None
+            if service_type == "qbittorrent":
+                result = instance.get_torrents(status="completed")
+            elif service_type == "transmission":
+                result = instance.get_torrents(status=["seeding", "seed_pending", "stopped"])
+            if result is not None:
+                parsed = self._parse_torrent_list_result(result)
+                if parsed is not None:
+                    return parsed
+
+        if hasattr(instance, "get_completed_torrents"):
+            return list(instance.get_completed_torrents() or [])
+        return []
 
     def _collect_monitor_usage(self) -> dict:
         return {
