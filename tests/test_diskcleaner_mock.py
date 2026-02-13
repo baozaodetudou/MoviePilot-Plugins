@@ -827,6 +827,29 @@ class DiskCleanerMockTest(unittest.TestCase):
         self.assertTrue(any("下载器候选扫描无结果" in msg for msg in info_logs))
         self.assertTrue(any("tr:完成1 可选0" in msg for msg in info_logs))
 
+    def test_torrent_hash_supports_mapping_like_hash_string(self):
+        class _TorrentLike:
+            @staticmethod
+            def get(key, default=None):
+                data = {"hashString": "h-tr-1"}
+                return data.get(key, default)
+
+        self.assertEqual(self.DiskCleaner._torrent_hash(_TorrentLike()), "h-tr-1")
+
+    def test_torrent_seed_seconds_supports_mapping_like_done_date(self):
+        class _TorrentLike:
+            @staticmethod
+            def get(key, default=None):
+                data = {"doneDate": 1000}
+                return data.get(key, default)
+
+        original_time = self.plugin_mod.time.time
+        self.plugin_mod.time.time = lambda: 2000
+        try:
+            self.assertEqual(self.DiskCleaner._torrent_seed_seconds(_TorrentLike()), 1000)
+        finally:
+            self.plugin_mod.time.time = original_time
+
     def test_calc_usage_handles_space_usage_exception(self):
         cleaner = self._new_cleaner()
         usage = cleaner._calc_usage([Path("/tmp/noop")])

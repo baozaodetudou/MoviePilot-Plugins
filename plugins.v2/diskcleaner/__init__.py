@@ -33,7 +33,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "0.24"
+    plugin_version = "0.25"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -3505,36 +3505,65 @@ class DiskCleaner(_PluginBase):
     @staticmethod
     def _torrent_hash(torrent: Any) -> Optional[str]:
         if hasattr(torrent, "get"):
-            return torrent.get("hash")
-        return getattr(torrent, "hashString", None)
+            for key in ("hash", "hashString", "hash_string"):
+                try:
+                    value = torrent.get(key)
+                except Exception:
+                    value = None
+                if value:
+                    return str(value)
+        for attr in ("hashString", "hash", "hash_string"):
+            value = getattr(torrent, attr, None)
+            if value:
+                return str(value)
+        return None
 
     @staticmethod
     def _torrent_name(torrent: Any) -> str:
         if hasattr(torrent, "get"):
-            return str(torrent.get("name") or "")
-        return str(getattr(torrent, "name", ""))
+            try:
+                value = torrent.get("name") or torrent.get("title")
+            except Exception:
+                value = None
+            if value:
+                return str(value)
+        return str(getattr(torrent, "name", None) or getattr(torrent, "title", "") or "")
 
     @staticmethod
     def _torrent_seed_seconds(torrent: Any) -> int:
         now = int(time.time())
 
-        if hasattr(torrent, "get"):
-            completed = torrent.get("completion_on") or torrent.get("completed_on") or 0
+        def _to_ts(value: Any) -> int:
+            if value is None:
+                return 0
+            if hasattr(value, "timestamp"):
+                try:
+                    return int(value.timestamp())
+                except Exception:
+                    return 0
             try:
-                completed = int(completed)
+                return int(value)
             except Exception:
-                completed = 0
+                return 0
+
+        if hasattr(torrent, "get"):
+            completed = 0
+            for key in ("completion_on", "completed_on", "doneDate", "date_done"):
+                try:
+                    value = torrent.get(key)
+                except Exception:
+                    value = None
+                completed = _to_ts(value)
+                if completed > 0:
+                    break
             if completed <= 0:
                 return 0
             return max(0, now - completed)
 
-        date_done = getattr(torrent, "date_done", None)
-        if date_done and hasattr(date_done, "timestamp"):
-            return max(0, now - int(date_done.timestamp()))
-
-        done_date = getattr(torrent, "doneDate", None)
-        if isinstance(done_date, (int, float)) and done_date > 0:
-            return max(0, now - int(done_date))
+        for attr in ("date_done", "doneDate", "completion_on", "completed_on"):
+            completed = _to_ts(getattr(torrent, attr, None))
+            if completed > 0:
+                return max(0, now - completed)
 
         return 0
 
