@@ -735,19 +735,6 @@ class DiskCleaner(_PluginBase):
                                 ],
                             },
                             {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "success",
-                                    "variant": "tonal",
-                                    "density": "compact",
-                                    "class": "mt-2",
-                                },
-                                "content": [
-                                    {"component": "div", "text": "使用文档（含三种模式流程图与判断关系）"},
-                                    {"component": "div", "props": {"class": "text-caption"}, "text": self.plugin_doc_url},
-                                ],
-                            },
-                            {
                                 "component": "VRow",
                                 "content": [
                                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
