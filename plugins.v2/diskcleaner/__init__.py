@@ -252,36 +252,12 @@ class DiskCleaner(_PluginBase):
                 "methods": ["GET"],
                 "summary": "确认风险提示已阅读",
                 "description": "用户首次阅读风险提示后写入确认标记",
-            },
-            {
-                "path": "/run_once",
-                "endpoint": self.run_once,
-                "methods": ["GET"],
-                "summary": "立即执行一次清理",
-                "description": "手动触发一次清理任务",
-            },
+            }
         ]
 
     def ack_risk_notice(self):
         self.save_data("risk_notice_acked", True)
         return {"success": True}
-
-    def run_once(self):
-        if self._lock.locked():
-            return {"success": False, "message": "任务正在执行中，请稍后重试"}
-
-        def _runner():
-            try:
-                self._task()
-            except Exception as err:
-                logger.error(f"{self.plugin_name}手动触发执行失败：{err}", exc_info=True)
-
-        threading.Thread(
-            target=_runner,
-            name=f"{self.__class__.__name__}-manual-run",
-            daemon=True,
-        ).start()
-        return {"success": True, "message": "已触发立即清理任务，请稍后刷新查看结果"}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         downloader_items = [
@@ -300,7 +276,6 @@ class DiskCleaner(_PluginBase):
             # 兜底：首次进入配置页后不再重复弹窗，避免前端事件异常导致反复提示
             self.save_data("risk_notice_shown_once", True)
         risk_notice_ack_api = f"/api/v1/plugin/{self.__class__.__name__}/ack_risk_notice?apikey={settings.API_TOKEN}"
-        run_once_api = f"/api/v1/plugin/{self.__class__.__name__}/run_once?apikey={settings.API_TOKEN}"
         delete_module = [
             {
                 "component": "VAlert",
@@ -851,32 +826,6 @@ class DiskCleaner(_PluginBase):
                             {"component": "VWindowItem", "props": {"value": "tab-media"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": media_module}]},
                             {"component": "VWindowItem", "props": {"value": "tab-downloader"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": downloader_module}]},
                             {"component": "VWindowItem", "props": {"value": "tab-post"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": post_module}]},
-                        ],
-                    },
-                    {
-                        "component": "VDivider",
-                    },
-                    {
-                        "component": "VCardActions",
-                        "content": [
-                            {"component": "VSpacer"},
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "error",
-                                    "variant": "flat",
-                                    "size": "small",
-                                    "onClick": (
-                                        "function(){ "
-                                        f"fetch('{run_once_api}').then(function(resp){{return resp.json();}}).then(function(res){{ "
-                                        "var msg = (res && (res.message || (res.success ? '已触发立即清理任务' : '触发失败'))) || '请求已发送'; "
-                                        "if (window && window.alert) { window.alert(msg); } "
-                                        "}}).catch(function(){ if (window && window.alert) { window.alert('触发失败，请查看日志'); } }); "
-                                        "}"
-                                    ),
-                                },
-                                "text": "立即清理",
-                            },
                         ],
                     },
                 ],
@@ -2079,11 +2028,6 @@ class DiskCleaner(_PluginBase):
 
         planned_media = len(media_targets)
         planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
-        can_delete_seed = self._can_delete_torrent_in_media_flow(
-            downloader=downloader,
-            torrent_hash=download_hash,
-            target=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
-        )
         planned_downloader = 1 if self._clean_downloader_seed and download_hash and downloader else 0
         planned_transfer = (
             1 if (self._clean_transfer_history and scope_enabled and history) else
