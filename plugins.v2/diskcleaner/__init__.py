@@ -278,21 +278,31 @@ class DiskCleaner(_PluginBase):
         risk_notice_ack_api = f"/api/v1/plugin/{self.__class__.__name__}/ack_risk_notice?apikey={settings.API_TOKEN}"
         delete_module = [
             {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "text": "删除动作将按触发流程串行执行。建议保留“删除整理记录/下载记录”，避免重复命中历史数据。",
+                    "class": "mb-2",
+                },
+            },
+            {
                 "component": "VRow",
                 "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_media_data", "label": "删除媒体数据"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_scrape_data", "label": "删除刮削数据"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_transfer_history", "label": "删除整理记录"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_download_history", "label": "删除下载记录"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_media_data", "label": "删除媒体数据"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_scrape_data", "label": "删除刮削数据"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_transfer_history", "label": "删除整理记录"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_download_history", "label": "删除下载记录"}}]},
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
-                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_allowlist", "label": "删除白名单路径", "rows": 2, "placeholder": "一行一个路径；留空默认使用MP目录"}}],
+                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_allowlist", "label": "允许删除路径（白名单）", "rows": 2, "placeholder": "一行一个路径；留空默认使用 MP 媒体目录"}}],
                     },
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
-                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_blocklist", "label": "删除黑名单路径", "rows": 2, "placeholder": "一行一个路径；命中后永不删除"}}],
+                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_blocklist", "label": "禁止删除路径（黑名单）", "rows": 2, "placeholder": "一行一个路径；命中后永不删除"}}],
                     },
                 ],
             },
@@ -604,7 +614,7 @@ class DiskCleaner(_PluginBase):
                                     "type": "info",
                                     "variant": "tonal",
                                     "density": "compact",
-                                    "text": "先选触发流程（单选），再配置各模块参数。删除按所选链路串行执行。",
+                                    "text": "先选触发流程，再配置各模块参数；删除会按所选链路串行执行。",
                                     "class": "mb-2",
                                 },
                             },
@@ -621,18 +631,18 @@ class DiskCleaner(_PluginBase):
                                                     "density": "compact",
                                                     "hideDetails": True,
                                                     "model": "trigger_flow",
-                                                    "label": "触发流程（单选｜决定删除链路）",
+                                                    "label": "触发流程（单选）",
                                                     "items": [
                                                         {
-                                                            "title": "1. 媒体优先（推荐）｜媒体目录阈值 -> 优先联动MP/下载器（缺失时仅删本地）",
+                                                            "title": "1. 媒体优先（推荐）",
                                                             "value": "flow_library_mp_downloader",
                                                         },
                                                         {
-                                                            "title": "2. 下载器优先｜下载器阈值/做种时长 -> MP整理记录 -> 媒体数据",
+                                                            "title": "2. 下载器优先",
                                                             "value": "flow_downloader_mp_library",
                                                         },
                                                         {
-                                                            "title": "3. 整理记录优先｜MP整理记录（旧到新） -> 媒体数据 + 下载器做种",
+                                                            "title": "3. 整理记录优先",
                                                             "value": "flow_transfer_oldest",
                                                         },
                                                     ],
@@ -648,9 +658,14 @@ class DiskCleaner(_PluginBase):
                                     "type": "info",
                                     "variant": "tonal",
                                     "density": "compact",
-                                    "text": "建议：常规场景选“媒体优先”；做种占用高选“下载器优先”；需要按历史最旧顺序清理选“整理记录优先”。",
                                     "class": "mt-2",
                                 },
+                                "content": [
+                                    {"component": "div", "text": "流程说明："},
+                                    {"component": "div", "text": "1）媒体优先：媒体目录阈值 -> 优先联动 MP/下载器（缺失时仅删本地）"},
+                                    {"component": "div", "text": "2）下载器优先：下载器阈值/做种时长 -> MP 整理记录 -> 媒体数据"},
+                                    {"component": "div", "text": "3）整理记录优先：MP 整理记录（旧到新） -> 媒体数据 + 下载器做种"},
+                                ],
                             },
                             {
                                 "component": "VAlert",
@@ -680,12 +695,27 @@ class DiskCleaner(_PluginBase):
                             {
                                 "component": "VRow",
                                 "content": [
-                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "onlyonce", "label": "立即运行"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "force_hardlink_cleanup", "label": "硬链接强制删除(兜底)"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "onlyonce", "label": "立即运行"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "force_hardlink_cleanup", "label": "硬链接强制删除（兜底）"}}]},
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 6},
+                                        "content": [{"component": "VCronField", "props": {"density": "compact", "hideDetails": True, "model": "cron", "label": "执行周期", "placeholder": "0 */8 * * *"}}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 6},
+                                        "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "cooldown_minutes", "label": "冷却时间(分钟)"}}],
+                                    },
                                 ],
                             },
                             {
@@ -694,26 +724,16 @@ class DiskCleaner(_PluginBase):
                                     {
                                         "component": "VCol",
                                         "props": {"cols": 12, "md": 4},
-                                        "content": [{"component": "VCronField", "props": {"density": "compact", "hideDetails": True, "model": "cron", "label": "执行周期", "placeholder": "0 */8 * * *"}}],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 12, "md": 4},
-                                        "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "cooldown_minutes", "label": "冷却时间(分钟)"}}],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "max_delete_items", "label": "单轮最多处理条目"}}],
                                     },
                                     {
                                         "component": "VCol",
-                                        "props": {"cols": 12, "md": 6},
+                                        "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "max_gb_per_run", "label": "单轮最多释放(GB)"}}],
                                     },
                                     {
                                         "component": "VCol",
-                                        "props": {"cols": 12, "md": 6},
+                                        "props": {"cols": 12, "md": 4},
                                         "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "max_gb_per_day", "label": "每日最多释放(GB)"}}],
                                     },
                                 ],
@@ -741,10 +761,10 @@ class DiskCleaner(_PluginBase):
                         "component": "VWindow",
                         "props": {"model": "tab"},
                         "content": [
-                            {"component": "VWindowItem", "props": {"value": "tab-delete"}, "content": [{"component": "VCardText", "content": delete_module}]},
-                            {"component": "VWindowItem", "props": {"value": "tab-media"}, "content": [{"component": "VCardText", "content": media_module}]},
-                            {"component": "VWindowItem", "props": {"value": "tab-downloader"}, "content": [{"component": "VCardText", "content": downloader_module}]},
-                            {"component": "VWindowItem", "props": {"value": "tab-post"}, "content": [{"component": "VCardText", "content": post_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-delete"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": delete_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-media"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": media_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-downloader"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": downloader_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-post"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": post_module}]},
                         ],
                     },
                 ],
