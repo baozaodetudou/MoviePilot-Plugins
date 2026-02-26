@@ -496,7 +496,42 @@ class DiskCleaner(_PluginBase):
                             "component": "VCard",
                             "props": {"variant": "elevated"},
                             "content": [
-                                {"component": "VCardTitle", "text": "使用警告（请先阅读 5 秒）"},
+                                {
+                                    "component": "VCardTitle",
+                                    "content": [
+                                        {
+                                            "component": "VRow",
+                                            "props": {"class": "align-center", "noGutters": True},
+                                            "content": [
+                                                {
+                                                    "component": "VCol",
+                                                    "props": {"cols": 12, "md": 8},
+                                                    "content": [
+                                                        {"component": "div", "text": "使用警告（请先阅读 5 秒）"},
+                                                        {"component": "div", "props": {"class": "text-caption"}, "text": "使用文档（含三种模式流程图与判断关系）"},
+                                                    ],
+                                                },
+                                                {
+                                                    "component": "VCol",
+                                                    "props": {"cols": 12, "md": 4, "class": "d-flex justify-md-end mt-2 mt-md-0"},
+                                                    "content": [
+                                                        {
+                                                            "component": "VBtn",
+                                                            "props": {
+                                                                "size": "small",
+                                                                "variant": "outlined",
+                                                                "color": "primary",
+                                                                "href": self.plugin_doc_url,
+                                                                "target": "_blank",
+                                                            },
+                                                            "text": "打开使用文档",
+                                                        }
+                                                    ],
+                                                },
+                                            ],
+                                        }
+                                    ],
+                                },
                                 {"component": "VDivider"},
                                 {
                                     "component": "VCardText",
@@ -678,18 +713,6 @@ class DiskCleaner(_PluginBase):
                                 "content": [
                                     {"component": "div", "text": "使用文档（含三种模式流程图与判断关系）"},
                                     {"component": "div", "props": {"class": "text-caption"}, "text": self.plugin_doc_url},
-                                    {
-                                        "component": "VBtn",
-                                        "props": {
-                                            "class": "mt-2",
-                                            "size": "small",
-                                            "variant": "outlined",
-                                            "color": "primary",
-                                            "href": self.plugin_doc_url,
-                                            "target": "_blank",
-                                        },
-                                        "text": "打开使用文档",
-                                    },
                                 ],
                             },
                             {
