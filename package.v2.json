@@ -50,12 +50,13 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
-        "version": "1.3",
+        "version": "1.4",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
         "level": 1,
         "history": {
+            "v1.4": "重构“立即清理”交互：保留三个入口（配置页/数据页固定按钮/运行总览），统一为直接调用 clean 接口；移除 iframe 跳转与日志弹窗联动，修复数据页点击不触发问题。",
             "v1.3": "版本号升级。",
             "v1.2": "新增 download_hash 缺失兜底：按媒体文件路径反查下载记录并补全 hash/downloader，提升流程1/流程3联动删除下载记录与删种成功率。",
             "v1.1": "新增任务完成清理明细汇总日志：按条输出清理目标、触发原因、执行结果与释放容量，便于核验为何被清理。",

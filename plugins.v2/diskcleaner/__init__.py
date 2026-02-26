@@ -3,6 +3,7 @@ import re
 import shutil
 import threading
 import time
+from collections import deque
 from enum import Enum
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,7 @@ from app.plugins import _PluginBase
 from app.schemas import NotificationType, RefreshMediaItem
 from app.schemas.types import MediaType
 from app.utils.system import SystemUtils
+from fastapi.responses import PlainTextResponse
 
 
 class DiskCleaner(_PluginBase):
@@ -33,7 +35,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -252,12 +254,62 @@ class DiskCleaner(_PluginBase):
                 "methods": ["GET"],
                 "summary": "确认风险提示已阅读",
                 "description": "用户首次阅读风险提示后写入确认标记",
-            }
+            },
+            {
+                "path": "/clean",
+                "endpoint": self._trigger_manual_clean,
+                "methods": ["GET"],
+                "summary": "手动清理",
+                "description": "手动触发一次清理任务",
+            },
+            {
+                "path": "/logs",
+                "endpoint": self._tail_plugin_logs,
+                "methods": ["GET"],
+                "summary": "查看磁盘清理日志",
+                "description": "返回最近磁盘清理相关日志内容",
+            },
         ]
 
     def ack_risk_notice(self):
         self.save_data("risk_notice_acked", True)
         return {"success": True}
+
+    def _trigger_manual_clean(self):
+        if self._lock.locked():
+            return {"success": False, "message": "任务正在执行中，请稍后重试"}
+
+        def _runner():
+            try:
+                self._task(manual_run=True)
+            except Exception as err:
+                logger.error(f"{self.plugin_name}手动触发执行失败：{err}", exc_info=True)
+
+        threading.Thread(
+            target=_runner,
+            name=f"{self.__class__.__name__}-manual-run",
+            daemon=True,
+        ).start()
+        return {"success": True, "message": "已触发手动清理任务，请稍后刷新查看结果"}
+
+    def _tail_plugin_logs(self):
+        log_file = Path(settings.LOG_PATH) / "moviepilot.log"
+        if not log_file.exists():
+            return PlainTextResponse("日志文件不存在", status_code=404)
+
+        keywords = [self.plugin_name, self.__class__.__name__, "diskcleaner", "DiskCleaner"]
+        lines = deque(maxlen=200)
+        try:
+            with log_file.open("r", encoding="utf-8", errors="ignore") as fp:
+                for line in fp:
+                    if any((kw and kw in line) for kw in keywords):
+                        lines.append(line.rstrip("\n"))
+        except Exception as err:
+            return PlainTextResponse(f"读取日志失败：{err}", status_code=500)
+
+        if not lines:
+            return PlainTextResponse("暂无磁盘清理相关日志")
+        return PlainTextResponse("\n".join(lines))
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         downloader_items = [
@@ -276,6 +328,7 @@ class DiskCleaner(_PluginBase):
             # 兜底：首次进入配置页后不再重复弹窗，避免前端事件异常导致反复提示
             self.save_data("risk_notice_shown_once", True)
         risk_notice_ack_api = f"/api/v1/plugin/{self.__class__.__name__}/ack_risk_notice?apikey={settings.API_TOKEN}"
+        manual_clean_api = f"/api/v1/plugin/{self.__class__.__name__}/clean?apikey={settings.API_TOKEN}"
         delete_module = [
             {
                 "component": "VAlert",
@@ -473,6 +526,64 @@ class DiskCleaner(_PluginBase):
             },
         ]
 
+        manual_button_injector = [
+            {
+                "component": "div",
+                "props": {
+                    "onVnodeMounted": (
+                        "function(){ "
+                        "if (window.__diskCleanerManualButtonWatcher) { "
+                        "clearInterval(window.__diskCleanerManualButtonWatcher); "
+                        "} "
+                        f"var cleanApi = '{manual_clean_api}'; "
+                        "var ensure = function(){ "
+                        "var findBtn = function(label){ "
+                        "var nodes = Array.from(document.querySelectorAll('button, .v-btn')); "
+                        "for (var i = nodes.length - 1; i >= 0; i--) { "
+                        "var n = nodes[i]; "
+                        "if (!n || !n.offsetParent) { continue; } "
+                        "var t = ((n.innerText || n.textContent || '')).replace(/\\s+/g, ''); "
+                        "if (t.indexOf(label) !== -1) { "
+                        "return (n.classList && n.classList.contains('v-btn')) ? n : ((n.closest && n.closest('.v-btn')) || n); "
+                        "} "
+                        "} "
+                        "return null; "
+                        "}; "
+                        "var saveBtn = findBtn('保存'); "
+                        "if (!saveBtn || !saveBtn.parentElement) { return; } "
+                        "if (document.getElementById('diskcleaner-manual-clean-save-btn')) { return; } "
+                        "var btn = document.createElement('button'); "
+                        "btn.id = 'diskcleaner-manual-clean-save-btn'; "
+                        "btn.type = 'button'; "
+                        "btn.className = saveBtn.className; "
+                        "btn.style.marginRight = '8px'; "
+                        "btn.innerText = '立即清理'; "
+                        "btn.onclick = function(e){ "
+                        "if (e) { e.preventDefault(); e.stopPropagation(); } "
+                        "fetch(cleanApi).catch(function(){}); "
+                        "}; "
+                        "saveBtn.parentElement.insertBefore(btn, saveBtn); "
+                        "}; "
+                        "window.__diskCleanerManualButtonWatcher = setInterval(ensure, 300); "
+                        "ensure(); "
+                        "}"
+                    ),
+                    "onVnodeBeforeUnmount": (
+                        "function(){ "
+                        "if (window.__diskCleanerManualButtonWatcher) { "
+                        "clearInterval(window.__diskCleanerManualButtonWatcher); "
+                        "window.__diskCleanerManualButtonWatcher = null; "
+                        "} "
+                        "var btn = document.getElementById('diskcleaner-manual-clean-save-btn'); "
+                        "if (btn && btn.parentElement) { "
+                        "btn.parentElement.removeChild(btn); "
+                        "} "
+                        "}"
+                    ),
+                },
+            }
+        ]
+
         warning_prefix = []
         if show_risk_notice:
             warning_prefix = [
@@ -621,7 +732,7 @@ class DiskCleaner(_PluginBase):
                 },
             ]
 
-        return warning_prefix + [
+        return manual_button_injector + warning_prefix + [
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-3"},
@@ -881,6 +992,7 @@ class DiskCleaner(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
+        manual_clean_api = f"/api/v1/plugin/{self.__class__.__name__}/clean?apikey={settings.API_TOKEN}"
         usage = self._collect_monitor_usage()
         all_runs = self._collect_run_history()
         recent_runs = all_runs[:10]
@@ -1040,6 +1152,91 @@ class DiskCleaner(_PluginBase):
 
         return [
             {
+                "component": "div",
+                "props": {
+                    "onVnodeMounted": (
+                        "function(){ "
+                        "if (window.__diskCleanerPageActionWatcher) { "
+                        "clearInterval(window.__diskCleanerPageActionWatcher); "
+                        "} "
+                        f"var cleanApi = '{manual_clean_api}'; "
+                        "var ensure = function(){ "
+                        "var findBtn = function(label){ "
+                        "var nodes = Array.from(document.querySelectorAll('button, .v-btn')); "
+                        "for (var i = nodes.length - 1; i >= 0; i--) { "
+                        "var n = nodes[i]; "
+                        "if (!n || !n.offsetParent) { continue; } "
+                        "var t = ((n.innerText || n.textContent || '')).replace(/\\s+/g, ''); "
+                        "if (label === '配置' && (t.indexOf('配置') !== -1 || t.indexOf('设置') !== -1)) { "
+                        "return (n.classList && n.classList.contains('v-btn')) ? n : ((n.closest && n.closest('.v-btn')) || n); "
+                        "} "
+                        "if (label !== '配置' && t.indexOf(label) !== -1) { "
+                        "return (n.classList && n.classList.contains('v-btn')) ? n : ((n.closest && n.closest('.v-btn')) || n); "
+                        "} "
+                        "} "
+                        "return null; "
+                        "}; "
+                        "var findConfigBtn = function(){ "
+                        "var byText = findBtn('配置'); "
+                        "if (byText) { return byText; } "
+                        "var iconNodes = Array.from(document.querySelectorAll('.mdi-cog, .mdi-cog-outline, [class*=\"mdi-cog\"]')); "
+                        "for (var i = iconNodes.length - 1; i >= 0; i--) { "
+                        "var icon = iconNodes[i]; "
+                        "var btn = (icon.closest && icon.closest('.v-btn, button')) || null; "
+                        "if (btn && btn.offsetParent) { return btn; } "
+                        "} "
+                        "return null; "
+                        "}; "
+                        "var configBtn = findConfigBtn(); "
+                        "var btn = document.getElementById('diskcleaner-manual-clean-fixed-btn'); "
+                        "if (!btn) { return; } "
+                        "if (configBtn) { "
+                        "var rect = configBtn.getBoundingClientRect(); "
+                        "var top = rect.top + Math.max(0, (rect.height - 40) / 2); "
+                        "var left = rect.left - 112; "
+                        "if (left < 12) { left = 12; } "
+                        "btn.style.top = top + 'px'; "
+                        "btn.style.left = left + 'px'; "
+                        "btn.style.bottom = 'auto'; "
+                        "btn.style.right = 'auto'; "
+                        "} else { "
+                        "btn.style.right = '96px'; "
+                        "btn.style.bottom = '24px'; "
+                        "btn.style.left = 'auto'; "
+                        "btn.style.top = 'auto'; "
+                        "} "
+                        "}; "
+                        "window.__diskCleanerPageActionWatcher = setInterval(ensure, 300); "
+                        "ensure(); "
+                        "}"
+                    ),
+                    "onVnodeBeforeUnmount": (
+                        "function(){ "
+                        "if (window.__diskCleanerPageActionWatcher) { "
+                        "clearInterval(window.__diskCleanerPageActionWatcher); "
+                        "window.__diskCleanerPageActionWatcher = null; "
+                        "} "
+                        "}"
+                    ),
+                },
+            },
+            {
+                "component": "VBtn",
+                "props": {
+                    "id": "diskcleaner-manual-clean-fixed-btn",
+                    "variant": "elevated",
+                    "color": "success",
+                    "style": "position:fixed; right:96px; bottom:24px; z-index:2147483000; min-height:40px; border-radius:12px; font-weight:600;",
+                },
+                "events": {
+                    "click": {
+                        "api": manual_clean_api,
+                        "method": "GET",
+                    }
+                },
+                "text": "立即清理",
+            },
+            {
                 "component": "VCard",
                 "props": {"class": "mb-1", "variant": "outlined"},
                 "content": [
@@ -1047,7 +1244,39 @@ class DiskCleaner(_PluginBase):
                         "component": "VCardText",
                         "props": {"class": "py-1 px-2"},
                         "content": [
-                            {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "运行总览"},
+                            {
+                                "component": "VRow",
+                                "props": {"align": "center", "noGutters": True},
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 8},
+                                        "content": [{"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "运行总览"}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 4, "class": "text-right"},
+                                        "content": [
+                                            {
+                                                "component": "VBtn",
+                                                "props": {
+                                                    "id": "diskcleaner-manual-clean-overview-btn",
+                                                    "size": "x-small",
+                                                    "variant": "tonal",
+                                                    "color": "error",
+                                                },
+                                                "events": {
+                                                    "click": {
+                                                        "api": manual_clean_api,
+                                                        "method": "GET",
+                                                    }
+                                                },
+                                                "text": "立即清理",
+                                            }
+                                        ],
+                                    },
+                                ],
+                            },
                             {
                                 "component": "div",
                                 "props": {"class": "text-caption text-medium-emphasis"},
@@ -1194,9 +1423,7 @@ class DiskCleaner(_PluginBase):
                                         {
                                             "component": "VCol",
                                             "props": {"cols": 5, "class": "text-right"},
-                                            "content": [
-                                                {"component": "VIcon", "props": {"size": "12", "icon": icon}},
-                                            ],
+                                            "content": [{"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "·"}],
                                         },
                                     ],
                                 },
@@ -1361,7 +1588,7 @@ class DiskCleaner(_PluginBase):
         except Exception as err:
             logger.error(f"{self.plugin_name}停止服务失败：{err}")
 
-    def _task(self):
+    def _task(self, manual_run: bool = False):
         with self._lock:
             try:
                 if not self._transfer_oper:
@@ -1371,7 +1598,8 @@ class DiskCleaner(_PluginBase):
                 if not self._mediaserver_oper:
                     self._mediaserver_oper = MediaServerOper()
 
-                logger.info(f"{self.plugin_name}开始执行")
+                run_source = "手动触发" if manual_run else "定时触发"
+                logger.info(f"{self.plugin_name}开始执行（{run_source}）")
                 run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._current_run_freed_bytes = 0
                 self._playback_ts_cache = {}
@@ -1382,7 +1610,7 @@ class DiskCleaner(_PluginBase):
                 if self._enable_retry_queue and not self._dry_run:
                     retry_actions = self._process_retry_queue(limit=self._retry_batch_size)
 
-                if self._is_in_cooldown():
+                if (not manual_run) and self._is_in_cooldown():
                     if not retry_actions:
                         logger.info(f"{self.plugin_name}命中冷却时间，跳过执行")
                         self._append_run_history(
@@ -1397,7 +1625,7 @@ class DiskCleaner(_PluginBase):
                     logger.info(f"{self.plugin_name}命中冷却时间，仅执行失败补偿")
                     skip_normal_cleanup = True
 
-                if not self._dry_run and self._is_daily_limit_reached():
+                if (not manual_run) and (not self._dry_run) and self._is_daily_limit_reached():
                     if not retry_actions:
                         logger.warning(f"{self.plugin_name}已达当日释放上限，跳过执行")
                         self._append_run_history(
