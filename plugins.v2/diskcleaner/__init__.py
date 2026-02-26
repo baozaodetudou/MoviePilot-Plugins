@@ -302,10 +302,10 @@ class DiskCleaner(_PluginBase):
                                 "component": "VSwitch",
                                 "props": {
                                     "density": "compact",
+                                    "class": "text-no-wrap",
                                     "model": "force_hardlink_cleanup",
                                     "label": "检查硬链接并强制删除",
-                                    "hint": "危险操作：慎重开启。开启后会检查硬链接并强制删除磁盘对应文件，即使未开启“同步删除文件”，也可能删除做种文件。",
-                                    "persistentHint": True,
+                                    "title": "危险操作：慎重开启。开启后会检查硬链接并强制删除磁盘对应文件，即使未开启“同步删除文件”，也可能删除做种文件。",
                                 },
                             }
                         ],
