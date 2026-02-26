@@ -294,6 +294,7 @@ class DiskCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_scrape_data", "label": "删除刮削数据"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_transfer_history", "label": "删除整理记录"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_download_history", "label": "删除下载记录"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "force_hardlink_cleanup", "label": "硬链接强制删除（开发兜底）"}}]},
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
@@ -737,12 +738,11 @@ class DiskCleaner(_PluginBase):
                             {
                                 "component": "VRow",
                                 "content": [
-                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "onlyonce", "label": "立即运行"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "force_hardlink_cleanup", "label": "硬链接强制删除（兜底）"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "onlyonce", "label": "立即运行"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
                                 ],
                             },
                             {
