@@ -294,18 +294,18 @@ class DiskCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_scrape_data", "label": "删除刮削数据"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_transfer_history", "label": "删除整理记录"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_download_history", "label": "删除下载记录"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "force_hardlink_cleanup", "label": "检查硬链接并强制删除"}}]},
                     {
                         "component": "VCol",
-                        "props": {"cols": 12},
+                        "props": {"cols": 12, "md": 6},
                         "content": [
                             {
-                                "component": "VAlert",
+                                "component": "VSwitch",
                                 "props": {
-                                    "type": "warning",
-                                    "variant": "tonal",
                                     "density": "compact",
-                                    "text": "危险操作：慎重开启。开启后会检查硬链接并强制删除磁盘对应文件，即使未开启“同步删除文件”，也可能删除做种文件。",
+                                    "model": "force_hardlink_cleanup",
+                                    "label": "检查硬链接并强制删除",
+                                    "hint": "危险操作：慎重开启。开启后会检查硬链接并强制删除磁盘对应文件，即使未开启“同步删除文件”，也可能删除做种文件。",
+                                    "persistentHint": True,
                                 },
                             }
                         ],
