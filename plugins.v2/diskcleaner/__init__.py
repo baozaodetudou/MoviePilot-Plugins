@@ -35,7 +35,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -992,7 +992,7 @@ class DiskCleaner(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        manual_clean_api = f"/api/v1/plugin/{self.__class__.__name__}/clean?apikey={settings.API_TOKEN}"
+        manual_clean_event_api = f"plugin/{self.__class__.__name__}/clean"
         usage = self._collect_monitor_usage()
         all_runs = self._collect_run_history()
         recent_runs = all_runs[:10]
@@ -1152,75 +1152,6 @@ class DiskCleaner(_PluginBase):
 
         return [
             {
-                "component": "div",
-                "props": {
-                    "onVnodeMounted": (
-                        "function(){ "
-                        "if (window.__diskCleanerPageActionWatcher) { "
-                        "clearInterval(window.__diskCleanerPageActionWatcher); "
-                        "} "
-                        f"var cleanApi = '{manual_clean_api}'; "
-                        "var ensure = function(){ "
-                        "var findBtn = function(label){ "
-                        "var nodes = Array.from(document.querySelectorAll('button, .v-btn')); "
-                        "for (var i = nodes.length - 1; i >= 0; i--) { "
-                        "var n = nodes[i]; "
-                        "if (!n || !n.offsetParent) { continue; } "
-                        "var t = ((n.innerText || n.textContent || '')).replace(/\\s+/g, ''); "
-                        "if (label === '配置' && (t.indexOf('配置') !== -1 || t.indexOf('设置') !== -1)) { "
-                        "return (n.classList && n.classList.contains('v-btn')) ? n : ((n.closest && n.closest('.v-btn')) || n); "
-                        "} "
-                        "if (label !== '配置' && t.indexOf(label) !== -1) { "
-                        "return (n.classList && n.classList.contains('v-btn')) ? n : ((n.closest && n.closest('.v-btn')) || n); "
-                        "} "
-                        "} "
-                        "return null; "
-                        "}; "
-                        "var findConfigBtn = function(){ "
-                        "var byText = findBtn('配置'); "
-                        "if (byText) { return byText; } "
-                        "var iconNodes = Array.from(document.querySelectorAll('.mdi-cog, .mdi-cog-outline, [class*=\"mdi-cog\"]')); "
-                        "for (var i = iconNodes.length - 1; i >= 0; i--) { "
-                        "var icon = iconNodes[i]; "
-                        "var btn = (icon.closest && icon.closest('.v-btn, button')) || null; "
-                        "if (btn && btn.offsetParent) { return btn; } "
-                        "} "
-                        "return null; "
-                        "}; "
-                        "var configBtn = findConfigBtn(); "
-                        "var btn = document.getElementById('diskcleaner-manual-clean-fixed-btn'); "
-                        "if (!btn) { return; } "
-                        "if (configBtn) { "
-                        "var rect = configBtn.getBoundingClientRect(); "
-                        "var top = rect.top + Math.max(0, (rect.height - 40) / 2); "
-                        "var left = rect.left - 112; "
-                        "if (left < 12) { left = 12; } "
-                        "btn.style.top = top + 'px'; "
-                        "btn.style.left = left + 'px'; "
-                        "btn.style.bottom = 'auto'; "
-                        "btn.style.right = 'auto'; "
-                        "} else { "
-                        "btn.style.right = '96px'; "
-                        "btn.style.bottom = '24px'; "
-                        "btn.style.left = 'auto'; "
-                        "btn.style.top = 'auto'; "
-                        "} "
-                        "}; "
-                        "window.__diskCleanerPageActionWatcher = setInterval(ensure, 300); "
-                        "ensure(); "
-                        "}"
-                    ),
-                    "onVnodeBeforeUnmount": (
-                        "function(){ "
-                        "if (window.__diskCleanerPageActionWatcher) { "
-                        "clearInterval(window.__diskCleanerPageActionWatcher); "
-                        "window.__diskCleanerPageActionWatcher = null; "
-                        "} "
-                        "}"
-                    ),
-                },
-            },
-            {
                 "component": "VBtn",
                 "props": {
                     "id": "diskcleaner-manual-clean-fixed-btn",
@@ -1230,8 +1161,9 @@ class DiskCleaner(_PluginBase):
                 },
                 "events": {
                     "click": {
-                        "api": manual_clean_api,
+                        "api": manual_clean_event_api,
                         "method": "GET",
+                        "params": {"apikey": settings.API_TOKEN},
                     }
                 },
                 "text": "立即清理",
@@ -1267,8 +1199,9 @@ class DiskCleaner(_PluginBase):
                                                 },
                                                 "events": {
                                                     "click": {
-                                                        "api": manual_clean_api,
+                                                        "api": manual_clean_event_api,
                                                         "method": "GET",
+                                                        "params": {"apikey": settings.API_TOKEN},
                                                     }
                                                 },
                                                 "text": "立即清理",
