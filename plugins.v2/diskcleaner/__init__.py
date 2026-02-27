@@ -36,7 +36,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.8"
+    plugin_version = "1.9"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -94,6 +94,9 @@ class DiskCleaner(_PluginBase):
     _media_path_mapping: List[str] = []
     _media_path_rules: List[Tuple[str, str]] = []
     _current_run_freed_bytes = 0
+    _current_run_empty_dirs_deleted: Dict[str, bool] = {}
+    _current_run_no_media_dirs_deleted: Dict[str, bool] = {}
+    _current_run_no_media_checks = 0
     _library_scope_filter_notice_logged = False
     _last_library_scan_summary = ""
     _last_library_scan_stats: Dict[str, int] = {}
@@ -1512,6 +1515,39 @@ class DiskCleaner(_PluginBase):
             )
         logger.info(f"{self.plugin_name}本轮清理明细结束")
 
+    def _record_dir_cleanup_item(self, bucket: Dict[str, bool], path: Path):
+        if not path:
+            return
+        try:
+            bucket[Path(path).as_posix()] = True
+        except Exception:
+            return
+
+    def _log_dir_cleanup_summary(self):
+        empty_dirs = list((self._current_run_empty_dirs_deleted or {}).keys())
+        no_media_dirs = list((self._current_run_no_media_dirs_deleted or {}).keys())
+        no_media_checks = int(self._current_run_no_media_checks or 0)
+        if not empty_dirs and not no_media_dirs and no_media_checks <= 0:
+            return
+
+        logger.info(
+            f"{self.plugin_name}目录回收汇总：空目录删除 {len(empty_dirs)} 个 | "
+            f"无媒体目录检查 {no_media_checks} 次，命中删除 {len(no_media_dirs)} 个"
+        )
+        if empty_dirs:
+            logger.info(
+                f"{self.plugin_name}空目录删除清单："
+                f"{self._paths_preview_text(empty_dirs, limit=10)}"
+            )
+        if no_media_checks > 0:
+            if no_media_dirs:
+                logger.info(
+                    f"{self.plugin_name}无媒体目录删除清单："
+                    f"{self._paths_preview_text(no_media_dirs, limit=10)}"
+                )
+            else:
+                logger.info(f"{self.plugin_name}无媒体目录检查结果：未命中可删除目录")
+
     @staticmethod
     def _sanitize_for_json(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -1605,6 +1641,9 @@ class DiskCleaner(_PluginBase):
                 logger.info(f"{self.plugin_name}开始执行（{run_source}）")
                 run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._current_run_freed_bytes = 0
+                self._current_run_empty_dirs_deleted = {}
+                self._current_run_no_media_dirs_deleted = {}
+                self._current_run_no_media_checks = 0
                 self._playback_ts_cache = {}
                 self._last_library_scan_summary = ""
                 self._last_library_scan_stats = {}
@@ -1700,6 +1739,7 @@ class DiskCleaner(_PluginBase):
                     reason="执行完成",
                 )
                 self._log_action_details(actions=all_actions, usage=usage)
+                self._log_dir_cleanup_summary()
                 self.save_data("last_run_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 logger.info(
                     f"{self.plugin_name}执行完成，本次处理 {len(all_actions)} 条，"
@@ -3834,7 +3874,10 @@ class DiskCleaner(_PluginBase):
             try:
                 if any(current.iterdir()):
                     break
+                deleted_dir = current
                 current.rmdir()
+                self._record_dir_cleanup_item(self._current_run_empty_dirs_deleted, deleted_dir)
+                logger.info(f"{self.plugin_name}删除空目录：{deleted_dir.as_posix()}")
                 current = current.parent
             except Exception:
                 break
@@ -3850,6 +3893,7 @@ class DiskCleaner(_PluginBase):
             return
         if not self._is_path_in_roots(parent, library_roots):
             return
+        self._current_run_no_media_checks += 1
 
         block_roots = self._block_paths()
         protected_roots = {}
@@ -3876,9 +3920,11 @@ class DiskCleaner(_PluginBase):
             if self._dir_contains_media_file(current, media_exts):
                 break
             try:
+                deleted_dir = current
                 shutil.rmtree(current)
-                logger.info(f"{self.plugin_name}删除无媒体文件目录：{current.as_posix()}")
-                current = current.parent
+                self._record_dir_cleanup_item(self._current_run_no_media_dirs_deleted, deleted_dir)
+                logger.info(f"{self.plugin_name}删除无媒体文件目录：{deleted_dir.as_posix()}")
+                current = deleted_dir.parent
             except Exception:
                 break
 
