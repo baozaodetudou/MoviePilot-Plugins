@@ -22,10 +22,11 @@ from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.directory import DirectoryHelper
 from app.helper.downloader import DownloaderHelper
 from app.helper.mediaserver import MediaServerHelper
+from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType, RefreshMediaItem
-from app.schemas.types import MediaType
+from app.schemas.types import MediaType, EventType
 from app.utils.system import SystemUtils
 from fastapi.responses import PlainTextResponse
 
@@ -35,7 +36,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -244,7 +245,39 @@ class DiskCleaner(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "cmd": "/clean_local_disk",
+                "event": EventType.PluginAction,
+                "desc": "检查并清理本地磁盘",
+                "category": "磁盘管理",
+                "data": {"action": "clean_local_disk"},
+            }
+        ]
+
+    @eventmanager.register(EventType.PluginAction)
+    def handle_remote_command(self, event: Event):
+        if not event or not event.event_data:
+            return
+
+        event_data = event.event_data
+        if event_data.get("action") != "clean_local_disk":
+            return
+
+        channel = event_data.get("channel")
+        userid = event_data.get("user")
+        self.post_message(
+            channel=channel,
+            userid=userid,
+            title="🧹 磁盘清理：开始执行远程命令",
+        )
+        result = self._trigger_manual_clean()
+        self.post_message(
+            channel=channel,
+            userid=userid,
+            title="✅ 磁盘清理命令已受理" if result.get("success") else "⚠️ 磁盘清理命令未执行",
+            text=result.get("message"),
+        )
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
