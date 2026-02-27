@@ -35,7 +35,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -868,11 +868,10 @@ class DiskCleaner(_PluginBase):
                             {
                                 "component": "VRow",
                                 "content": [
-                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "onlyonce", "label": "立即运行"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 2}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
                                 ],
                             },
                             {

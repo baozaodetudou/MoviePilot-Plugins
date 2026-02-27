@@ -41,12 +41,13 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
-        "version": "1.5",
+        "version": "1.6",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
         "level": 2,
         "history": {
+            "v1.6": "基础设置优化：删除“立即运行”开关，保留启用/通知/演练/清空历史四个开关并改为等宽紧凑排列，减少占用空间。",
             "v1.5": "修复数据页“立即清理”接口路径拼接错误（避免 /api/v1/api/v1）；移除数据页字符串 onVnodeMounted 注入，消除 Vue 警告；三个入口统一可稳定触发 clean 接口。",
             "v1.4": "重构“立即清理”交互：保留三个入口（配置页/数据页固定按钮/运行总览），统一为直接调用 clean 接口；移除 iframe 跳转与日志弹窗联动，修复数据页点击不触发问题。",
             "v1.3": "版本号升级。",

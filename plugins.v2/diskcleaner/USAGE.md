@@ -1,9 +1,12 @@
 # 磁盘清理（DiskCleaner）使用说明
 
-本文档面向 `v1.5+`，用于快速理解三种触发模式、关键判断关系、参数影响与日志排查方式。
+本文档面向 `v1.6+`，用于快速理解三种触发模式、关键判断关系、参数影响与日志排查方式。
 
 ## 0. 近期版本变更
 
+- `v1.6`
+  - 基础设置优化：移除“立即运行”开关。
+  - 基础开关区改为四项等宽紧凑排列：`启用 / 通知 / 演练 / 清空历史`。
 - `v1.5`
   - 修复数据页“立即清理”路径拼接错误：统一改为 `plugin/DiskCleaner/clean + apikey`，避免出现 `/api/v1/api/v1/...` 导致 404。
   - 移除数据页字符串 `onVnodeMounted` 注入，消除 `Invalid value type passed to callWithAsyncErrorHandling(): string` 警告。
