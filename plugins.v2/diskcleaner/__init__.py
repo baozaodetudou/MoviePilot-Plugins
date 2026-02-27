@@ -36,7 +36,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -87,6 +87,8 @@ class DiskCleaner(_PluginBase):
     _force_hardlink_cleanup = False
     _clean_transfer_history = True
     _clean_download_history = True
+    _clean_empty_media_dirs = True
+    _empty_media_exts = "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v"
     _path_allowlist: List[str] = []
     _path_blocklist: List[str] = []
     _media_path_mapping: List[str] = []
@@ -171,6 +173,11 @@ class DiskCleaner(_PluginBase):
             self._force_hardlink_cleanup = bool(config.get("force_hardlink_cleanup", False))
             self._clean_transfer_history = bool(config.get("clean_transfer_history", True))
             self._clean_download_history = bool(config.get("clean_download_history", True))
+            self._clean_empty_media_dirs = bool(config.get("clean_empty_media_dirs", True))
+            self._empty_media_exts = self._normalize_media_ext_config(
+                config.get("empty_media_exts"),
+                default=self._empty_media_exts,
+            )
             self._path_allowlist = self._parse_path_list(config.get("path_allowlist"))
             self._path_blocklist = self._parse_path_list(config.get("path_blocklist"))
             self._media_path_mapping = self._parse_path_list(config.get("media_path_mapping"))
@@ -201,6 +208,8 @@ class DiskCleaner(_PluginBase):
                 or str(config.get("library_threshold_value", "") or "").strip() != normalized_library_text
                 or "media_flow_seed_check" not in config
                 or "force_hardlink_cleanup" not in config
+                or "clean_empty_media_dirs" not in config
+                or "empty_media_exts" not in config
             ):
                 self.__update_config()
 
@@ -397,6 +406,33 @@ class DiskCleaner(_PluginBase):
                                 "component": "div",
                                 "props": {"class": "text-caption text-warning text-no-wrap ml-2"},
                                 "text": "⚠️ 危险操作：慎重开启。开启后会检查硬链接并强制删除磁盘对应文件，即使未开启“同步删除文件”，也可能删除做种文件。",
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_empty_media_dirs", "label": "删除空媒体目录"}}],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextarea",
+                                "props": {
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "model": "empty_media_exts",
+                                    "label": "空目录检查媒体扩展名",
+                                    "rows": 2,
+                                    "placeholder": "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v",
+                                },
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                "text": "按逗号分隔；目录及其子目录不包含这些扩展名文件时，将删除该目录。",
                             },
                         ],
                     },
@@ -1008,6 +1044,8 @@ class DiskCleaner(_PluginBase):
             "delete_downloader_files": False,
             "clean_transfer_history": True,
             "clean_download_history": True,
+            "clean_empty_media_dirs": True,
+            "empty_media_exts": "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v",
             "prefer_playback_history": True,
             "media_path_mapping": "",
             "path_allowlist": "",
@@ -2298,12 +2336,13 @@ class DiskCleaner(_PluginBase):
             "download_history": self._build_step_result(planned_download, removed_download),
         }
         failed_steps = self._collect_failed_steps(step_result)
+        target_path = cleanup_target.as_posix() if cleanup_target else media_path.as_posix()
         if failed_steps and not self._dry_run and self._enable_retry_queue:
             self._enqueue_retry({
                 "mode": "media",
                 "retry_key": f"media:{media_path.as_posix()}:{download_hash or ''}",
                 "trigger": trigger,
-                "target": media_path.as_posix(),
+                "target": target_path,
                 "media_path": media_path.as_posix(),
                 "media_targets": [item.as_posix() for item in media_targets],
                 "sidecars": [item.as_posix() for item in sidecars],
@@ -2331,7 +2370,7 @@ class DiskCleaner(_PluginBase):
         return {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "trigger": trigger,
-            "target": media_path.as_posix(),
+            "target": target_path,
             "action": action_text,
             "freed_bytes": freed_bytes,
             "mode": "dry-run" if self._dry_run else "apply",
@@ -3783,6 +3822,7 @@ class DiskCleaner(_PluginBase):
             return False
 
         self._delete_empty_parent_dirs(parent, allow_roots)
+        self._delete_no_media_parent_dirs(parent, allow_roots)
         return True
 
     def _delete_empty_parent_dirs(self, parent: Path, roots: List[Path]):
@@ -3798,6 +3838,62 @@ class DiskCleaner(_PluginBase):
                 current = current.parent
             except Exception:
                 break
+
+    def _delete_no_media_parent_dirs(self, parent: Path, roots: List[Path]):
+        if not self._clean_empty_media_dirs:
+            return
+        media_exts = self._media_ext_set_for_empty_dir_check()
+        if not media_exts:
+            return
+        library_roots = self._library_paths()
+        if not library_roots:
+            return
+        if not self._is_path_in_roots(parent, library_roots):
+            return
+
+        block_roots = self._block_paths()
+        protected_roots = {}
+        for root in list(roots) + list(library_roots):
+            protected_roots[root.as_posix()] = root
+        root_set = set(protected_roots.keys())
+
+        current = parent
+        while current and current.exists():
+            current_key = current.as_posix()
+            if current_key in root_set:
+                break
+            if not self._is_path_in_roots(current, roots):
+                break
+            if not self._is_path_in_roots(current, library_roots):
+                break
+            if self._is_path_in_roots(current, block_roots):
+                break
+            try:
+                if not current.is_dir() or current.is_symlink():
+                    break
+            except Exception:
+                break
+            if self._dir_contains_media_file(current, media_exts):
+                break
+            try:
+                shutil.rmtree(current)
+                logger.info(f"{self.plugin_name}删除无媒体文件目录：{current.as_posix()}")
+                current = current.parent
+            except Exception:
+                break
+
+    @staticmethod
+    def _dir_contains_media_file(directory: Path, media_exts: set) -> bool:
+        if not directory or not media_exts:
+            return False
+        try:
+            for current_root, _, files in os.walk(directory.as_posix()):
+                for filename in files:
+                    if Path(filename).suffix.lower() in media_exts:
+                        return True
+        except Exception:
+            return True
+        return False
 
     @staticmethod
     def _is_path_in_roots(path: Path, roots: List[Path]) -> bool:
@@ -4748,6 +4844,32 @@ class DiskCleaner(_PluginBase):
             values = [line.strip() for line in text.splitlines()]
         return [item for item in values if item]
 
+    @staticmethod
+    def _split_media_ext_values(raw: Any) -> List[str]:
+        values = re.split(r"[,\n;，]+", str(raw or ""))
+        result: List[str] = []
+        for item in values:
+            ext = str(item).strip().lower().lstrip(".")
+            if ext:
+                result.append(ext)
+        return result
+
+    def _normalize_media_ext_config(self, raw: Any, default: Optional[str] = None) -> str:
+        base_text = str(raw or "").strip()
+        if not base_text:
+            base_text = str(default or "").strip()
+        items = self._split_media_ext_values(base_text)
+        if not items:
+            items = self._split_media_ext_values(self._empty_media_exts)
+        dedup: Dict[str, bool] = {}
+        for ext in items:
+            dedup[ext] = True
+        return ",".join(dedup.keys())
+
+    def _media_ext_set_for_empty_dir_check(self) -> set:
+        items = self._split_media_ext_values(self._empty_media_exts)
+        return {f".{ext}" for ext in items if ext}
+
     def _parse_media_path_mappings(self, raw_mappings: List[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
         normalized_lines: List[str] = []
         rules: List[Tuple[str, str]] = []
@@ -4969,6 +5091,11 @@ class DiskCleaner(_PluginBase):
         self._tv_complete_only = bool(self._tv_complete_only)
         self._media_flow_seed_check = bool(self._media_flow_seed_check)
         self._force_hardlink_cleanup = bool(self._force_hardlink_cleanup)
+        self._clean_empty_media_dirs = bool(self._clean_empty_media_dirs)
+        self._empty_media_exts = self._normalize_media_ext_config(
+            self._empty_media_exts,
+            default="mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v",
+        )
         self._refresh_mode = "item" if self._refresh_mode not in ("item", "root") else self._refresh_mode
         self._refresh_batch_size = max(1, min(200, int(self._refresh_batch_size)))
         self._retry_max_attempts = max(1, min(20, int(self._retry_max_attempts)))
@@ -5033,6 +5160,8 @@ class DiskCleaner(_PluginBase):
                 "delete_downloader_files": self._delete_downloader_files,
                 "clean_transfer_history": self._clean_transfer_history,
                 "clean_download_history": self._clean_download_history,
+                "clean_empty_media_dirs": self._clean_empty_media_dirs,
+                "empty_media_exts": self._empty_media_exts,
                 "path_allowlist": "\n".join(self._path_allowlist),
                 "path_blocklist": "\n".join(self._path_blocklist),
                 "media_path_mapping": "\n".join(self._media_path_mapping),
