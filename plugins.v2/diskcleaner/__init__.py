@@ -36,7 +36,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.10"
+    plugin_version = "1.11"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -2320,8 +2320,8 @@ class DiskCleaner(_PluginBase):
         media_targets: List[Path] = []
         if self._clean_media_data and cleanup_target and cleanup_target.exists():
             media_targets.append(cleanup_target)
-        # 兜底策略：当缺失MP关联时，按硬链接关系清理同inode文件（常见于下载目录与媒体库硬链接）。
-        if self._force_hardlink_cleanup and self._clean_media_data and not history and cleanup_target:
+        # 强制策略：开启后按硬链接关系扩展清理同 inode 文件（含下载目录与媒体库硬链接）。
+        if self._force_hardlink_cleanup and self._clean_media_data and cleanup_target:
             media_targets = self._expand_media_targets_with_hardlinks(
                 media_targets=media_targets,
                 roots=delete_roots,
