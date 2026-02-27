@@ -50,12 +50,13 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录。",
-        "version": "1.9",
+        "version": "1.10",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
         "level": 1,
         "history": {
+            "v1.10": "删除设置新增“禁止删除关键词”，路径命中关键词即整条跳过；白名单策略停用；支持在常规清理、补偿重试与目录回收中统一生效。",
             "v1.9": "新增目录回收可观测日志：按轮输出空目录/无媒体目录检查与命中删除汇总，并打印删除清单，便于核验目录回收是否生效。",
             "v1.8": "新增“删除空媒体目录”开关与媒体扩展名自定义；删除后自动清理无媒体文件目录；修复电视剧清理明细目标显示为季目录。",
             "v1.7": "新增远程命令 /clean_local_disk，支持在 Telegram/企业微信直接触发“检查并清理本地磁盘”。",

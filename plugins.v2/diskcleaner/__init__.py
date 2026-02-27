@@ -36,7 +36,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "1.9"
+    plugin_version = "1.10"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v2/diskcleaner/USAGE.md"
@@ -91,12 +91,14 @@ class DiskCleaner(_PluginBase):
     _empty_media_exts = "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v"
     _path_allowlist: List[str] = []
     _path_blocklist: List[str] = []
+    _path_block_keywords: List[str] = []
     _media_path_mapping: List[str] = []
     _media_path_rules: List[Tuple[str, str]] = []
     _current_run_freed_bytes = 0
     _current_run_empty_dirs_deleted: Dict[str, bool] = {}
     _current_run_no_media_dirs_deleted: Dict[str, bool] = {}
     _current_run_no_media_checks = 0
+    _current_run_dir_cleanup_dryrun_skips = 0
     _library_scope_filter_notice_logged = False
     _last_library_scan_summary = ""
     _last_library_scan_stats: Dict[str, int] = {}
@@ -183,6 +185,7 @@ class DiskCleaner(_PluginBase):
             )
             self._path_allowlist = self._parse_path_list(config.get("path_allowlist"))
             self._path_blocklist = self._parse_path_list(config.get("path_blocklist"))
+            self._path_block_keywords = self._parse_keyword_list(config.get("path_block_keywords"))
             self._media_path_mapping = self._parse_path_list(config.get("media_path_mapping"))
 
             self._refresh_mediaserver = bool(config.get("refresh_mediaserver", False))
@@ -213,6 +216,7 @@ class DiskCleaner(_PluginBase):
                 or "force_hardlink_cleanup" not in config
                 or "clean_empty_media_dirs" not in config
                 or "empty_media_exts" not in config
+                or "path_block_keywords" not in config
             ):
                 self.__update_config()
 
@@ -442,12 +446,24 @@ class DiskCleaner(_PluginBase):
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
-                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_allowlist", "label": "允许删除路径（白名单）", "rows": 2, "placeholder": "一行一个路径；留空默认使用 MP 媒体目录"}}],
+                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_blocklist", "label": "禁止删除路径（黑名单）", "rows": 2, "placeholder": "一行一个路径；命中后永不删除"}}],
                     },
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
-                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_blocklist", "label": "禁止删除路径（黑名单）", "rows": 2, "placeholder": "一行一个路径；命中后永不删除"}}],
+                        "content": [
+                            {
+                                "component": "VTextarea",
+                                "props": {
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "model": "path_block_keywords",
+                                    "label": "禁止删除关键词",
+                                    "rows": 2,
+                                    "placeholder": "多个关键词用逗号或换行分隔；路径命中任一关键词即整条跳过",
+                                },
+                            }
+                        ],
                     },
                 ],
             },
@@ -1053,6 +1069,7 @@ class DiskCleaner(_PluginBase):
             "media_path_mapping": "",
             "path_allowlist": "",
             "path_blocklist": "",
+            "path_block_keywords": "",
             "refresh_mediaserver": False,
             "refresh_mode": "item",
             "refresh_batch_size": 20,
@@ -1527,7 +1544,14 @@ class DiskCleaner(_PluginBase):
         empty_dirs = list((self._current_run_empty_dirs_deleted or {}).keys())
         no_media_dirs = list((self._current_run_no_media_dirs_deleted or {}).keys())
         no_media_checks = int(self._current_run_no_media_checks or 0)
-        if not empty_dirs and not no_media_dirs and no_media_checks <= 0:
+        dryrun_skips = int(self._current_run_dir_cleanup_dryrun_skips or 0)
+        if not empty_dirs and not no_media_dirs and no_media_checks <= 0 and dryrun_skips <= 0:
+            return
+        if self._dry_run and dryrun_skips > 0:
+            logger.info(
+                f"{self.plugin_name}目录回收汇总：演练模式已跳过目录回收检查 {dryrun_skips} 次，"
+                f"空目录/无媒体目录不执行实际删除"
+            )
             return
 
         logger.info(
@@ -1644,6 +1668,7 @@ class DiskCleaner(_PluginBase):
                 self._current_run_empty_dirs_deleted = {}
                 self._current_run_no_media_dirs_deleted = {}
                 self._current_run_no_media_checks = 0
+                self._current_run_dir_cleanup_dryrun_skips = 0
                 self._playback_ts_cache = {}
                 self._last_library_scan_summary = ""
                 self._last_library_scan_stats = {}
@@ -2023,6 +2048,7 @@ class DiskCleaner(_PluginBase):
         skipped_recent = 0
         skipped_tv_unended = 0
         skipped_no_target = 0
+        skipped_block_keyword = 0
         for history in sorted(records, key=_sort_key):
             hid = int(getattr(history, "id", 0) or 0)
             if hid > 0 and hid in skipped_ids:
@@ -2034,6 +2060,9 @@ class DiskCleaner(_PluginBase):
             if not self._is_tv_cleanup_allowed(history):
                 skipped_tv_unended += 1
                 continue
+            if self._path_contains_block_keyword(getattr(history, "dest", None)):
+                skipped_block_keyword += 1
+                continue
             if not getattr(history, "dest", None) and not getattr(history, "download_hash", None):
                 skipped_no_target += 1
                 continue
@@ -2041,7 +2070,7 @@ class DiskCleaner(_PluginBase):
         logger.info(
             f"{self.plugin_name}流程3整理记录统计：总{len(records)} 符合条件{len(candidates)} | "
             f"近期保护{skipped_recent} 未完结{skipped_tv_unended} "
-            f"无目标{skipped_no_target} 已跳过{skipped_mark}"
+            f"关键词过滤{skipped_block_keyword} 无目标{skipped_no_target} 已跳过{skipped_mark}"
         )
         if not candidates:
             return None
@@ -2078,6 +2107,11 @@ class DiskCleaner(_PluginBase):
             roots=delete_roots,
         )
         target_text = cleanup_target.as_posix() if cleanup_target else (str(dest) if dest else "-")
+        if self._should_skip_by_block_keywords(
+            paths=[cleanup_target, media_path, dest],
+            context="流程3-整理记录清理",
+        ):
+            return None
         download_hash, downloader = self._resolve_download_context_fallback(
             download_hash=download_hash,
             downloader=downloader,
@@ -2259,6 +2293,11 @@ class DiskCleaner(_PluginBase):
             history=history,
             roots=delete_roots,
         )
+        if self._should_skip_by_block_keywords(
+            paths=[cleanup_target, media_path],
+            context="流程1-媒体候选清理",
+        ):
+            return None
         download_hash, downloader = self._resolve_download_context_fallback(
             download_hash=download_hash,
             downloader=downloader,
@@ -2499,6 +2538,12 @@ class DiskCleaner(_PluginBase):
             context=f"{downloader}:{name}",
             enabled=self._force_hardlink_cleanup and self._clean_media_data,
         )
+        history_dests = [getattr(item, "dest", None) for item in histories if getattr(item, "dest", None)]
+        if self._should_skip_by_block_keywords(
+            paths=history_dests + [item.as_posix() for item in media_targets] + [item.as_posix() for item in download_file_targets],
+            context=f"流程2-下载器任务清理({downloader}:{name})",
+        ):
+            return None
         if scope_enabled and not histories and self._force_hardlink_cleanup and self._clean_media_data:
             if not any(self._is_path_in_roots(item, library_paths) for item in media_targets):
                 logger.info(f"{self.plugin_name}下载器任务未匹配到媒体库范围，跳过：{downloader}:{name}")
@@ -2647,6 +2692,7 @@ class DiskCleaner(_PluginBase):
         skipped_tv_unended = 0
         skipped_stat_error = 0
         skipped_by_mark = 0
+        skipped_block_keyword = 0
 
         for root in library_paths:
             if not root.exists():
@@ -2662,6 +2708,9 @@ class DiskCleaner(_PluginBase):
                         continue
                     if path.suffix.lower() not in media_exts:
                         skipped_non_media += 1
+                        continue
+                    if self._path_contains_block_keyword(path):
+                        skipped_block_keyword += 1
                         continue
                     matched_media_ext += 1
                     try:
@@ -2696,16 +2745,19 @@ class DiskCleaner(_PluginBase):
                 "filtered_marked": skipped_by_mark,
                 "filtered_stat_error": skipped_stat_error,
                 "filtered_non_media": skipped_non_media,
+                "filtered_block_keyword": skipped_block_keyword,
             }
             self._last_library_scan_summary = (
                 f"媒体候选扫描结束：未找到可清理媒体文件 | "
                 f"目录 {existing_roots}/{total_roots} | 扫描文件 {scanned_files} | "
                 f"媒体文件 {matched_media_ext} | 非媒体扩展 {skipped_non_media} | 近期保护 {skipped_recent} | "
-                f"未完结电视剧 {skipped_tv_unended} | 已跳过标记 {skipped_by_mark} | 读取失败 {skipped_stat_error}"
+                f"未完结电视剧 {skipped_tv_unended} | 关键词过滤 {skipped_block_keyword} | "
+                f"已跳过标记 {skipped_by_mark} | 读取失败 {skipped_stat_error}"
             )
             logger.info(
                 f"{self.plugin_name}流程1媒体库任务统计：总文件{scanned_files} 媒体文件{matched_media_ext} "
-                f"符合条件0 | 近期保护{skipped_recent} 未完结{skipped_tv_unended} 已跳过{skipped_by_mark}"
+                f"符合条件0 | 近期保护{skipped_recent} 未完结{skipped_tv_unended} "
+                f"关键词过滤{skipped_block_keyword} 已跳过{skipped_by_mark}"
             )
             logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
             return None
@@ -2738,6 +2790,7 @@ class DiskCleaner(_PluginBase):
             "filtered_marked": skipped_by_mark,
             "filtered_stat_error": skipped_stat_error,
             "filtered_non_media": skipped_non_media,
+            "filtered_block_keyword": skipped_block_keyword,
         }
         self._last_library_scan_summary = (
             f"媒体候选扫描完成：候选 {len(candidates)} 条 "
@@ -2746,7 +2799,8 @@ class DiskCleaner(_PluginBase):
         )
         logger.info(
             f"{self.plugin_name}流程1媒体库任务统计：总文件{scanned_files} 媒体文件{matched_media_ext} "
-            f"符合条件{len(candidates)} | 近期保护{skipped_recent} 未完结{skipped_tv_unended} 已跳过{skipped_by_mark}"
+            f"符合条件{len(candidates)} | 近期保护{skipped_recent} 未完结{skipped_tv_unended} "
+            f"关键词过滤{skipped_block_keyword} 已跳过{skipped_by_mark}"
         )
         logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
 
@@ -3832,6 +3886,10 @@ class DiskCleaner(_PluginBase):
         path = Path(path)
         if not path.exists() and not path.is_symlink():
             return False
+        block_keyword = self._path_contains_block_keyword(path)
+        if block_keyword:
+            logger.warning(f"{self.plugin_name}命中禁止删除关键词，跳过删除：{path.as_posix()}（关键词：{block_keyword}）")
+            return False
 
         allow_roots = self._effective_allow_roots(roots)
         if not self._is_path_in_roots(path, allow_roots):
@@ -3848,6 +3906,8 @@ class DiskCleaner(_PluginBase):
                 return False
 
         if self._dry_run:
+            if self._clean_empty_media_dirs:
+                self._current_run_dir_cleanup_dryrun_skips += 1
             return True
 
         try:
@@ -3870,6 +3930,10 @@ class DiskCleaner(_PluginBase):
         root_set = {root.as_posix() for root in roots}
         while current and current.exists():
             if current.as_posix() in root_set:
+                break
+            block_keyword = self._path_contains_block_keyword(current)
+            if block_keyword:
+                logger.info(f"{self.plugin_name}命中禁止删除关键词，跳过目录回收：{current.as_posix()}（关键词：{block_keyword}）")
                 break
             try:
                 if any(current.iterdir()):
@@ -3911,6 +3975,10 @@ class DiskCleaner(_PluginBase):
             if not self._is_path_in_roots(current, library_roots):
                 break
             if self._is_path_in_roots(current, block_roots):
+                break
+            block_keyword = self._path_contains_block_keyword(current)
+            if block_keyword:
+                logger.info(f"{self.plugin_name}命中禁止删除关键词，跳过无媒体目录回收：{current.as_posix()}（关键词：{block_keyword}）")
                 break
             try:
                 if not current.is_dir() or current.is_symlink():
@@ -4246,6 +4314,23 @@ class DiskCleaner(_PluginBase):
         download_hash = payload.get("download_hash")
         downloader = payload.get("downloader")
         history_dest = payload.get("history_dest")
+        if self._should_skip_by_block_keywords(
+            paths=[media_path, history_dest] + [item.as_posix() for item in media_targets] + [item.as_posix() for item in sidecars],
+            context="失败补偿-媒体任务",
+        ):
+            zero_steps = {
+                "media": self._build_step_result(0, 0),
+                "scrape": self._build_step_result(0, 0),
+                "downloader": self._build_step_result(0, 0),
+                "transfer_history": self._build_step_result(0, 0),
+                "download_history": self._build_step_result(0, 0),
+            }
+            return {
+                "steps": zero_steps,
+                "failed_steps": [],
+                "freed_bytes": 0,
+                "refresh_items": [],
+            }
         library_roots = self._library_paths()
         delete_roots = self._media_delete_roots(library_roots)
 
@@ -4314,6 +4399,23 @@ class DiskCleaner(_PluginBase):
         media_targets = [Path(item) for item in (payload.get("media_targets") or []) if item]
         sidecar_targets = [Path(item) for item in (payload.get("sidecar_targets") or []) if item]
         history_dests = [item for item in (payload.get("history_dests") or []) if item]
+        if self._should_skip_by_block_keywords(
+            paths=history_dests + [item.as_posix() for item in media_targets] + [item.as_posix() for item in sidecar_targets],
+            context=f"失败补偿-下载器任务({downloader}:{download_hash})",
+        ):
+            zero_steps = {
+                "media": self._build_step_result(0, 0),
+                "scrape": self._build_step_result(0, 0),
+                "downloader": self._build_step_result(0, 0),
+                "transfer_history": self._build_step_result(0, 0),
+                "download_history": self._build_step_result(0, 0),
+            }
+            return {
+                "steps": zero_steps,
+                "failed_steps": [],
+                "freed_bytes": 0,
+                "refresh_items": [],
+            }
         library_roots = self._library_paths()
         delete_roots = self._media_delete_roots(library_roots)
 
@@ -4860,14 +4962,47 @@ class DiskCleaner(_PluginBase):
         return False
 
     def _effective_allow_roots(self, fallback_roots: List[Path]) -> List[Path]:
-        allow = self._allow_paths()
-        return allow if allow else fallback_roots
+        # 白名单策略已弃用，始终以媒体目录/推导根目录为删除边界。
+        return fallback_roots
 
     def _allow_paths(self) -> List[Path]:
         return self._normalize_paths(self._path_allowlist)
 
     def _block_paths(self) -> List[Path]:
         return self._normalize_paths(self._path_blocklist)
+
+    def _block_keywords(self) -> List[str]:
+        return self._normalize_keyword_list(self._path_block_keywords)
+
+    def _path_contains_block_keyword(self, path: Any) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            path_text = Path(str(path)).as_posix()
+        except Exception:
+            path_text = str(path)
+        path_text_lc = path_text.lower()
+        for keyword in self._block_keywords():
+            key = str(keyword or "").strip().lower()
+            if key and key in path_text_lc:
+                return keyword
+        return None
+
+    def _should_skip_by_block_keywords(self, paths: List[Any], context: str) -> bool:
+        for raw_path in paths or []:
+            keyword = self._path_contains_block_keyword(raw_path)
+            if not keyword:
+                continue
+            try:
+                path_text = Path(str(raw_path)).as_posix()
+            except Exception:
+                path_text = str(raw_path)
+            logger.info(
+                f"{self.plugin_name}命中禁止删除关键词，整条跳过："
+                f"关键词={keyword} 路径={path_text} 场景={context}"
+            )
+            return True
+        return False
 
     @staticmethod
     def _normalize_paths(raw_paths: List[str]) -> List[Path]:
@@ -4889,6 +5024,30 @@ class DiskCleaner(_PluginBase):
             text = str(raw).replace(",", "\n")
             values = [line.strip() for line in text.splitlines()]
         return [item for item in values if item]
+
+    def _parse_keyword_list(self, raw: Any) -> List[str]:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            values = []
+            for item in raw:
+                values.extend(re.split(r"[,，;\n]+", str(item or "")))
+        else:
+            values = re.split(r"[,，;\n]+", str(raw or ""))
+        keywords = [str(item).strip() for item in values if str(item).strip()]
+        return self._normalize_keyword_list(keywords)
+
+    @staticmethod
+    def _normalize_keyword_list(raw_keywords: List[str]) -> List[str]:
+        dedup: Dict[str, str] = {}
+        for item in raw_keywords or []:
+            keyword = str(item or "").strip()
+            if not keyword:
+                continue
+            key = keyword.lower()
+            if key not in dedup:
+                dedup[key] = keyword
+        return list(dedup.values())
 
     @staticmethod
     def _split_media_ext_values(raw: Any) -> List[str]:
@@ -5161,6 +5320,7 @@ class DiskCleaner(_PluginBase):
         self._media_libraries = list(dedup_libraries.keys())
         self._path_allowlist = self._parse_path_list(self._path_allowlist)
         self._path_blocklist = self._parse_path_list(self._path_blocklist)
+        self._path_block_keywords = self._parse_keyword_list(self._path_block_keywords)
         self._media_path_mapping = self._parse_path_list(self._media_path_mapping)
         self._media_path_mapping, self._media_path_rules = self._parse_media_path_mappings(self._media_path_mapping)
         self._library_scope_cache = None
@@ -5210,6 +5370,7 @@ class DiskCleaner(_PluginBase):
                 "empty_media_exts": self._empty_media_exts,
                 "path_allowlist": "\n".join(self._path_allowlist),
                 "path_blocklist": "\n".join(self._path_blocklist),
+                "path_block_keywords": ",".join(self._path_block_keywords),
                 "media_path_mapping": "\n".join(self._media_path_mapping),
                 "refresh_mediaserver": self._refresh_mediaserver,
                 "refresh_mode": self._refresh_mode,
