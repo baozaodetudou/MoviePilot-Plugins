@@ -1,8 +1,8 @@
 import json
-import pkg_resources
+import os
 
 # 载入配置
-resource_path = pkg_resources.resource_filename(__name__, 'config.json')
+resource_path = os.path.join(os.path.dirname(__file__), 'config.json')
 
 # 不被支持的接口
 exclude = ["/request/reference", "/avatar/upload", "/cloud", "/playlist/cover/update", "/voice/upload",

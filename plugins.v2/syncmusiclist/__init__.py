@@ -24,7 +24,7 @@ class SyncMusicList(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/main/icons/music.png"
     # 插件版本
-    plugin_version = "7.2"
+    plugin_version = "7.2.1"
     # 插件作者
     plugin_author = "逗猫"
     # 作者主页
