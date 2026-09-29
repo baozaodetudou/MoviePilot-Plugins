@@ -8,13 +8,13 @@ from typing import Tuple, List, Dict, Any
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from playwright.sync_api import sync_playwright
 
 from app.chain.download import DownloadChain
 from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
+from app.helper.browser import BrowserPage, PlaywrightHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaType
@@ -25,7 +25,8 @@ class MaoyanRank(_PluginBase):
     """
     获取猫眼的排行榜进行订阅,建议每天一次
     电影获取的url: https://piaofang.maoyan.com/dashboard-ajax/movie
-    电视剧获取的url: {tv_url}?showDate=20240223&seriesType=0&platformType=0
+    剧集热度接口: https://piaofang.maoyan.com/i/api/encrypt/dashboard/webHeatData
+    网络电影接口: https://piaofang.maoyan.com/i/api/encrypt/dashboard/webHeatNetData
         参数 showDate: 时间具体到天
         参数 seriesType: 代表类型 0: 电视剧 1: 网络剧 2: 综艺 不传递-1代表电视剧+网络剧
         参数 platformType: 代表平台 0 全网 3 腾讯视频 2 爱奇艺 1 优酷 7 芒果 5 搜狐 4 乐视 6 PPTV 20 网络电影networkHot=3
@@ -744,8 +745,8 @@ class MaoyanRank(_PluginBase):
         刷新猫眼榜单数据
         电影获取的url:
         https://piaofang.maoyan.com/dashboard-ajax/movie
-        电视剧获取的url:
-        {tv_url}?showDate=20240223&seriesType=0&platformType=0
+        剧集热度接口:
+        {tv_url}?showDate=20240223&seriesType=0&platformType=3
         参数 showDate: 时间具体到天
         参数 seriesType: 代表类型 0: 电视剧 1: 网络剧 2: 综艺 不传递-1代表电视剧+网络剧
         参数 platformType: 代表平台 0 全网 3 腾讯视频 2 爱奇艺 1 优酷 7 芒果 5 搜狐 4 乐视 6 PPTV
@@ -761,83 +762,32 @@ class MaoyanRank(_PluginBase):
         web_movie_url = ''
         tv_urls = []
         # 获取当前日期时间格式化为字符串
-        format_date = current_time.strftime("%Y-%m-%d")
+        show_date = current_time.strftime("%Y%m%d")
         maoyan_url = 'https://piaofang.maoyan.com'
-        if 'movie' in self._type:
+        selected_types = self._type or []
+        if 'movie' in selected_types:
             movie_url = f'{maoyan_url}/dashboard-ajax/movie'
-        if 'web-movie' in self._type:
-
-            web_movie_url = (f'{maoyan_url}/dashboard/webMaoYanHotData?seriesType=0&platform=20&'
-                             f'date={format_date}&networkHot=3')
-        # 0: 电视剧  1: 网络剧 2: 综艺 不传递-1代表电视剧+网络剧
-        # 参数 platformType: 代表平台 0 全网 3 腾讯视频 2 爱奇艺 1 优酷 7 芒果
-        # 电视剧
-        tv_url = f'{maoyan_url}/dashboard/webHeatData'
-        if 'web-heat' in self._type:
-            # 全网
-            if self._all_enabled:
-                url = f'{tv_url}?seriesType=0&platformType=&showDate=2'
-                tv_urls.append([url, self._all_num])
-            # tx
-            if self._tx_enabled:
-                url = f'{tv_url}?seriesType=0&platformType=3&showDate=2'
-                tv_urls.append([url, self._tx_num])
-            # iqy
-            if self._iqy_enabled:
-                url = f'{tv_url}?seriesType=0&platformType=2&showDate=2'
-                tv_urls.append([url, self._iqy_num])
-            # mg
-            if self._mg_enabled:
-                url = f'{tv_url}?seriesType=0&platformType=7&showDate=2'
-                tv_urls.append([url, self._mg_num])
-            # yk
-            if self._yk_enabled:
-                url = f'{tv_url}?seriesType=0&platformType=1&showDate=2'
-                tv_urls.append([url, self._yk_num])
-        # 网剧
-        if 'web-tv' in self._type:
-            # 全网
-            if self._all_enabled:
-                url = f'{tv_url}?seriesType=1&platformType=&showDate=2'
-                tv_urls.append([url, self._all_num])
-            # tx
-            if self._tx_enabled:
-                url = f'{tv_url}?seriesType=1&platformType=3&showDate=2'
-                tv_urls.append([url, self._tx_num])
-            # iqy
-            if self._iqy_enabled:
-                url = f'{tv_url}?seriesType=1&platformType=2&showDate=2'
-                tv_urls.append([url, self._iqy_num])
-            # mg
-            if self._mg_enabled:
-                url = f'{tv_url}?seriesType=1&platformType=7&showDate=2'
-                tv_urls.append([url, self._mg_num])
-            # yk
-            if self._yk_enabled:
-                url = f'{tv_url}?seriesType=1&platformType=1&showDate=2'
-                tv_urls.append([url, self._yk_num])
-        # 综艺
-        if 'zongyi' in self._type:
-            # 全网
-            if self._all_enabled:
-                url = f'{tv_url}?seriesType=2&platformType=&showDate=2'
-                tv_urls.append([url, self._all_num])
-            # tx
-            if self._tx_enabled:
-                url = f'{tv_url}?seriesType=2&platformType=3&showDate=2'
-                tv_urls.append([url, self._tx_num])
-            # iqy
-            if self._iqy_enabled:
-                url = f'{tv_url}?seriesType=2&platformType=2&showDate=2'
-                tv_urls.append([url, self._iqy_num])
-            # mg
-            if self._mg_enabled:
-                url = f'{tv_url}?seriesType=2&platformType=7&showDate=2'
-                tv_urls.append([url, self._mg_num])
-            # yk
-            if self._yk_enabled:
-                url = f'{tv_url}?seriesType=2&platformType=1&showDate=2'
-                tv_urls.append([url, self._yk_num])
+        if 'web-movie' in selected_types:
+            web_movie_url = (f'{maoyan_url}/i/api/encrypt/dashboard/webHeatNetData?'
+                             f'showDate={show_date}&platformType=3&dateType=0&rankType=0')
+        tv_url = f'{maoyan_url}/i/api/encrypt/dashboard/webHeatData'
+        platforms = (
+            (None, self._all_enabled, self._all_num),
+            (3, self._tx_enabled, self._tx_num),
+            (2, self._iqy_enabled, self._iqy_num),
+            (7, self._mg_enabled, self._mg_num),
+            (1, self._yk_enabled, self._yk_num),
+        )
+        for category, series_type in (('web-heat', 0), ('web-tv', 1), ('zongyi', 2)):
+            if category not in selected_types:
+                continue
+            for platform_type, enabled, limit in platforms:
+                if not enabled:
+                    continue
+                query = f'showDate={show_date}&seriesType={series_type}'
+                if platform_type is not None:
+                    query += f'&platformType={platform_type}'
+                tv_urls.append([f'{tv_url}?{query}', limit])
         tv_list = []
         movie_list = []
         try:
@@ -848,7 +798,10 @@ class MaoyanRank(_PluginBase):
         self.set_sub(tv_list, history, MediaType.TV)
         # 保存历史记录
         self.save_data('history', history)
-        logger.info(f"猫眼订阅刷新完成")
+        if movie_list or tv_list:
+            logger.info(f"猫眼订阅刷新完成：电影 {len(movie_list)} 条，剧集 {len(tv_list)} 条")
+        else:
+            logger.warning("猫眼榜单未获取到数据，本轮未新增订阅")
 
     def set_sub(self, addr_list, history, mtype):
         # 获取当前日期时间
@@ -858,9 +811,8 @@ class MaoyanRank(_PluginBase):
                 title = addr.get('title')
                 try:
                     # 计算日期，获取年份信息
-                    subtract = int(''.join(re.findall(r'\d', addr.get('releaseInfo'))))
-                    target_time = current_time - datetime.timedelta(days=subtract)
-                    year = target_time.year
+                    days_text = ''.join(re.findall(r'\d', str(addr.get('releaseInfo') or '')))
+                    year = (current_time - datetime.timedelta(days=int(days_text))).year if days_text else None
                 except Exception as e:
                     logger.warn(e)
                     year = None
@@ -912,82 +864,109 @@ class MaoyanRank(_PluginBase):
 
     def __get_url_info(self, movie_url, tv_urls, web_movie_url, num=10):
         """
-        根据url获取
+        获取电影榜单，并在 CloakBrowser 页面中读取需要浏览器会话的热度榜单。
         """
         movies_list = []
         tv_list = []
-        user_agent = self.get_random_user_agent()
-        headers = {
-            'User-Agent': user_agent,
-        }
-        cookies = self.get_cookies()
         if movie_url:
             try:
-                # 打开网页
-                if cookies:
-                    response = RequestUtils().get_res(movie_url, cookies=cookies, headers=headers)
-                else:
-                    response = RequestUtils().get_res(movie_url, headers=headers)
-                # 获取页面内容
+                response = RequestUtils().get_res(
+                    movie_url, headers={'User-Agent': self.get_random_user_agent()})
+                if response is None:
+                    raise RuntimeError('无响应')
+                if not response.ok:
+                    raise RuntimeError(f'HTTP {response.status_code}')
+                if 'json' not in response.headers.get('content-type', '').lower():
+                    raise RuntimeError(f'响应不是 JSON（HTTP {response.status_code}）')
                 res = response.json()
-                data = res.get('movieList', {}).get('list', [])
-                def info(movie):
-                    infos = movie.get('movieInfo')
-                    return {
-                        "title": infos.get('movieName'),
-                        "releaseInfo": infos.get('releaseInfo'),
-                    }
-
-                movies_list += [info(i) for i in data][:num]
+                data = (res.get('movieList') or {}).get('list') or []
+                for movie in data[:num]:
+                    info = movie.get('movieInfo') or {}
+                    if info.get('movieName'):
+                        movies_list.append({
+                            'title': info['movieName'],
+                            'releaseInfo': info.get('releaseInfo'),
+                        })
             except Exception as e:
-                logger.error(f"获取网页源码失败: {str(e)}")
-        if web_movie_url:
-            try:
-                # 打开网页
-                if cookies:
-                    response = RequestUtils().get_res(web_movie_url, cookies=cookies, headers=headers)
-                else:
-                    response = RequestUtils().get_res(web_movie_url, headers=headers)
-                # 获取页面内容
-                res = response.json()
-                data = res.get('data', {}).get('list', [])
-                def info(movie):
-                    return {
-                        "title": movie.get('name'),
-                        "platformDesc": movie.get('platformDesc'),
-                    }
+                logger.error(f'获取猫眼电影榜单失败：{e}')
 
-                movies_list += [info(i) for i in data][:num]
-            except Exception as e:
-                logger.error(f"获取网页源码失败: {str(e)}")
-        if tv_urls:
-            for tv in tv_urls:
-                try:
-                    tv_url = tv[0]
-                    tv_num = tv[1]
-                    # 打开网页
-                    if cookies:
-                        response = RequestUtils().get_res(tv_url, cookies=cookies, headers=headers)
-                    else:
-                        response = RequestUtils().get_res(tv_url, headers=headers)
-                    # 获取页面内容
-                    res = response.json()
-                    data = res.get('dataList', {}).get('list', [])
-
-                    def tv_info(tv):
-                        infos = tv.get('seriesInfo')
-                        return {
-                            "title": infos.get('name'),
-                            "releaseInfo": infos.get('releaseInfo'),
-                            "platformDesc": infos.get('platformDesc'),
+        browser_requests = [{'kind': 'movie', 'url': web_movie_url, 'limit': num}] if web_movie_url else []
+        browser_requests.extend({'kind': 'tv', 'url': url, 'limit': limit} for url, limit in tv_urls)
+        if browser_requests:
+            def page_handler(page: BrowserPage) -> list:
+                return page.evaluate("""async (requests) => {
+                    const meta = name => document.querySelector(`meta[name="${name}"]`)?.content || '';
+                    const uid = meta('csrf');
+                    if (!uid) throw new Error('猫眼页面缺少会话标识');
+                    const headers = {uid};
+                    if (meta('deviceId')) headers.uuid = meta('deviceId');
+                    if (meta('channelId')) headers.channelId = meta('channelId');
+                    const results = [];
+                    for (const request of requests) {
+                        try {
+                            let response = await fetch(request.url, {headers});
+                            if (!response.ok) {
+                                results.push({kind: request.kind, error: `HTTP ${response.status}`});
+                                continue;
+                            }
+                            let body = await response.json();
+                            if (body.status === false && request.kind === 'movie') {
+                                const latest = body.calendarNet?.selectMaxDate?.replaceAll('-', '');
+                                const retryUrl = new URL(request.url, location.origin);
+                                if (latest && latest !== retryUrl.searchParams.get('showDate')) {
+                                    retryUrl.searchParams.set('showDate', latest);
+                                    response = await fetch(retryUrl.toString(), {headers});
+                                    if (!response.ok) {
+                                        results.push({kind: request.kind, error: `HTTP ${response.status}`});
+                                        continue;
+                                    }
+                                    body = await response.json();
+                                }
+                            }
+                            if (body.status === false) {
+                                results.push({kind: request.kind, error: '猫眼未提供该榜单数据'});
+                                continue;
+                            }
+                            const rows = body.dataList?.list;
+                            if (!Array.isArray(rows)) {
+                                results.push({kind: request.kind, error: '榜单数据格式已变化'});
+                                continue;
+                            }
+                            const limit = Math.max(0, Number(request.limit ?? 10));
+                            const items = rows.slice(0, limit).map(row => {
+                                const info = row.seriesInfo || row.movieInfo || row;
+                                return {title: info.name || info.movieName || '',
+                                        releaseInfo: info.releaseInfo || '',
+                                        platformDesc: info.platformDesc || ''};
+                            }).filter(item => item.title);
+                            results.push({kind: request.kind, items});
+                        } catch (error) {
+                            results.push({kind: request.kind, error: String(error)});
                         }
-                    tv_list.extend([tv_info(i) for i in data][:tv_num])
-                except Exception as e:
-                    logger.error(f"获取网页源码失败: {str(e)}")
-            # 使用字典推导式和集合保持唯一性
-            unique_dicts = {item['title']: item for item in tv_list}.values()
-            # 转回列表形式
-            tv_list = list(unique_dicts)
+                    }
+                    return results;
+                }""", browser_requests)
+
+            browser_results = PlaywrightHelper().action(
+                url='https://piaofang.maoyan.com',
+                callback=page_handler,
+                headless=True,
+                timeout=30,
+            )
+            if browser_results is None:
+                logger.error('CloakBrowser 获取猫眼榜单失败')
+            else:
+                for request, result in zip(browser_requests, browser_results):
+                    if result.get('error'):
+                        logger.warning(f"猫眼榜单 {request['url']}：{result['error']}")
+                    elif request['kind'] == 'movie':
+                        movies_list.extend(result.get('items') or [])
+                    else:
+                        tv_list.extend(result.get('items') or [])
+                if len(browser_results) != len(browser_requests):
+                    logger.error('猫眼榜单响应数量与请求数量不一致')
+
+        tv_list = list({item['title']: item for item in tv_list}.values())
 
         return movies_list, tv_list
 
@@ -999,22 +978,3 @@ class MaoyanRank(_PluginBase):
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
         return random.choice(user_agents)
-
-    @staticmethod
-    def get_cookies():
-        mao_cookies = {}
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            try:
-                page = browser.new_page()
-                page.goto('https://piaofang.maoyan.com')
-                cookies = page.context.cookies()
-                logger.debug(f"maoyan cookie: {cookies}")
-                mao_cookies = {c['name']: c['value'] for c in cookies}
-            except Exception as e:
-                logger.error(f"获取网页源码失败: {str(e)}")
-            finally:
-                # 关闭页面
-                browser.close()
-        return mao_cookies
-
