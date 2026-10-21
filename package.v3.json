@@ -2,7 +2,7 @@
     "DiskCleaner": {
         "name": "磁盘清理",
         "description": "按磁盘阈值与做种时长自动清理媒体、做种与 MP 整理记录。",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/main/icons/diskclean.png",
         "color": "#4CAF50",
         "author": "逗猫",
@@ -10,6 +10,7 @@
         "system_version": ">=3.0.0",
         "release": true,
         "history": {
+            "v3.0.1": "修复立即清理按钮的响应格式，消除任务已受理却提示无效响应的问题。",
             "v3.0.0": "V3 专用实现，修复整理记录查询、媒体身份与播放时间读取，保留原有清理配置。"
         }
     }
