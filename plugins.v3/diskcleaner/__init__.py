@@ -1,0 +1,5461 @@
+import os
+import re
+import shutil
+import threading
+import time
+from collections import deque
+from enum import Enum
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.chain.mediaserver import MediaServerChain
+from app.sdk.config import settings
+from app.db.oper.downloadhistory import DownloadHistoryOper
+from app.db.oper.mediaserver import MediaServerOper
+from app.db.oper.transferhistory import TransferHistoryOper
+from app.application.directory import DirectoryHelper
+from app.sdk.services import DownloaderHelper, MediaServerHelper
+from app.sdk.events import eventmanager, Event
+from app.sdk.logging import logger
+from app.sdk.plugin import _PluginBase
+from app.sdk.media import normalize_media_source
+from app.sdk.queries import list_transfer_history
+from app.schemas import NotificationType, RefreshMediaItem
+from app.schemas.query import TransferHistorySnapshot
+from app.schemas.types import MediaSource, MediaType, EventType
+from app.sdk.utilities import SystemUtils
+from fastapi.responses import PlainTextResponse
+
+
+class DiskCleaner(_PluginBase):
+    # 插件信息
+    plugin_name = "磁盘清理"
+    plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
+    plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
+    plugin_version = "3.0.0"
+    plugin_author = "逗猫"
+    author_url = "https://github.com/baozaodetudou"
+    plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v3/diskcleaner/USAGE.md"
+    plugin_config_prefix = "diskcleaner_"
+    plugin_order = 28
+    auth_level = 1
+
+    _lock = threading.Lock()
+
+    # 调度
+    _scheduler: Optional[BackgroundScheduler] = None
+    _enabled = False
+    _onlyonce = False
+    _clear_history = False
+    _notify = False
+    _cron = "0 */8 * * *"
+    _dry_run = True
+    _cooldown_minutes = 60
+
+    # 监听开关
+    _monitor_download = True
+    _monitor_library = True
+    _monitor_downloader = False
+    _trigger_flow = "flow_library_mp_downloader"
+
+    # 阈值配置
+    _download_threshold_mode = "size"  # size/percent
+    _download_threshold_value = 100.0
+    _library_threshold_mode = "size"
+    _library_threshold_value = 100.0
+
+    # 下载器策略
+    _downloaders: List[str] = []
+    _seeding_days = 15
+    _media_flow_seed_check = True
+    _max_delete_items = 5
+    _max_gb_per_run = 50.0
+    _max_gb_per_day = 200.0
+    _protect_recent_days = 30
+    _media_cleanup_priority = "movie"
+    _tv_complete_only = True
+
+    # 删除开关
+    _clean_media_data = True
+    _clean_scrape_data = True
+    _clean_downloader_seed = False
+    _delete_downloader_files = False
+    _force_hardlink_cleanup = False
+    _clean_transfer_history = True
+    _clean_download_history = True
+    _clean_empty_media_dirs = True
+    _empty_media_exts = "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v"
+    _path_allowlist: List[str] = []
+    _path_blocklist: List[str] = []
+    _path_block_keywords: List[str] = []
+    _media_path_mapping: List[str] = []
+    _media_path_rules: List[Tuple[str, str]] = []
+    _current_run_freed_bytes = 0
+    _current_run_empty_dirs_deleted: Dict[str, bool] = {}
+    _current_run_no_media_dirs_deleted: Dict[str, bool] = {}
+    _current_run_no_media_checks = 0
+    _current_run_dir_cleanup_dryrun_skips = 0
+    _library_scope_filter_notice_logged = False
+    _last_library_scan_summary = ""
+    _last_library_scan_stats: Dict[str, int] = {}
+
+    # 媒体库范围与刷新
+    _refresh_mediaserver = False
+    _refresh_mode = "item"  # item/root
+    _refresh_batch_size = 20
+    _media_servers: List[str] = []
+    _media_libraries: List[str] = []
+    _library_scope_cache: Optional[List[Path]] = None
+    _prefer_playback_history = True
+    _enable_retry_queue = True
+    _retry_max_attempts = 3
+    _retry_interval_minutes = 30
+    _retry_batch_size = 5
+
+    # 数据操作
+    _transfer_oper: Optional[TransferHistoryOper] = None
+    _download_oper: Optional[DownloadHistoryOper] = None
+    _mediaserver_oper: Optional[MediaServerOper] = None
+    _mediaserver_chain: Optional[MediaServerChain] = None
+    _playback_ts_cache: Dict[str, int] = {}
+    _tv_end_state_cache: Dict[str, bool] = {}
+
+    def init_plugin(self, config: dict = None):
+        self.stop_service()
+
+        self._transfer_oper = TransferHistoryOper()
+        self._download_oper = DownloadHistoryOper()
+        self._mediaserver_oper = MediaServerOper()
+        self._mediaserver_chain = None
+        self._playback_ts_cache = {}
+        self._tv_end_state_cache = {}
+        self._library_scope_cache = None
+        self._last_library_scan_stats = {}
+
+        if config:
+            self._enabled = bool(config.get("enabled", False))
+            self._onlyonce = bool(config.get("onlyonce", False))
+            self._clear_history = bool(config.get("clear_history", False))
+            self._notify = bool(config.get("notify", False))
+            self._cron = config.get("cron") or "0 */8 * * *"
+            self._dry_run = bool(config.get("dry_run", True))
+            self._cooldown_minutes = int(self._safe_float(config.get("cooldown_minutes"), 60))
+
+            self._monitor_download = bool(config.get("monitor_download", True))
+            self._monitor_library = bool(config.get("monitor_library", True))
+            self._monitor_downloader = bool(config.get("monitor_downloader", False))
+            self._trigger_flow = config.get("trigger_flow") or "flow_library_mp_downloader"
+
+            self._download_threshold_mode = config.get("download_threshold_mode") or "size"
+            self._download_threshold_value = self._parse_threshold_value(
+                config.get("download_threshold_value"),
+                self._download_threshold_mode,
+            )
+            self._library_threshold_mode = config.get("library_threshold_mode") or "size"
+            self._library_threshold_value = self._parse_threshold_value(
+                config.get("library_threshold_value"),
+                self._library_threshold_mode,
+            )
+
+            self._downloaders = config.get("downloaders") or []
+            self._seeding_days = int(self._safe_float(config.get("seeding_days"), 15))
+            self._media_flow_seed_check = bool(config.get("media_flow_seed_check", True))
+            self._max_delete_items = max(1, int(self._safe_float(config.get("max_delete_items"), 5)))
+            self._max_gb_per_run = self._safe_float(config.get("max_gb_per_run"), 50.0)
+            self._max_gb_per_day = self._safe_float(config.get("max_gb_per_day"), 200.0)
+            self._protect_recent_days = int(self._safe_float(config.get("protect_recent_days"), 30))
+            self._media_cleanup_priority = self._normalize_media_priority(config.get("media_cleanup_priority", "movie"))
+            self._tv_complete_only = bool(config.get("tv_complete_only", True))
+
+            self._clean_media_data = bool(config.get("clean_media_data", True))
+            self._clean_scrape_data = bool(config.get("clean_scrape_data", True))
+            self._clean_downloader_seed = bool(config.get("clean_downloader_seed", False))
+            self._delete_downloader_files = bool(config.get("delete_downloader_files", False))
+            self._force_hardlink_cleanup = bool(config.get("force_hardlink_cleanup", False))
+            self._clean_transfer_history = bool(config.get("clean_transfer_history", True))
+            self._clean_download_history = bool(config.get("clean_download_history", True))
+            self._clean_empty_media_dirs = bool(config.get("clean_empty_media_dirs", True))
+            self._empty_media_exts = self._normalize_media_ext_config(
+                config.get("empty_media_exts"),
+                default=self._empty_media_exts,
+            )
+            self._path_allowlist = self._parse_path_list(config.get("path_allowlist"))
+            self._path_blocklist = self._parse_path_list(config.get("path_blocklist"))
+            self._path_block_keywords = self._parse_keyword_list(config.get("path_block_keywords"))
+            self._media_path_mapping = self._parse_path_list(config.get("media_path_mapping"))
+
+            self._refresh_mediaserver = bool(config.get("refresh_mediaserver", False))
+            self._refresh_mode = config.get("refresh_mode") or "item"
+            self._refresh_batch_size = int(self._safe_float(config.get("refresh_batch_size"), 20))
+            self._media_servers = config.get("media_servers") or config.get("refresh_servers") or []
+            self._media_libraries = config.get("media_libraries") or []
+            self._prefer_playback_history = bool(config.get("prefer_playback_history", True))
+            self._enable_retry_queue = bool(config.get("enable_retry_queue", True))
+            self._retry_max_attempts = int(self._safe_float(config.get("retry_max_attempts"), 3))
+            self._retry_interval_minutes = int(self._safe_float(config.get("retry_interval_minutes"), 30))
+            self._retry_batch_size = int(self._safe_float(config.get("retry_batch_size"), 5))
+
+        self._normalize_config()
+        if config:
+            normalized_download_text = self._format_threshold_value(
+                self._download_threshold_value,
+                self._download_threshold_mode,
+            )
+            normalized_library_text = self._format_threshold_value(
+                self._library_threshold_value,
+                self._library_threshold_mode,
+            )
+            if (
+                str(config.get("download_threshold_value", "") or "").strip() != normalized_download_text
+                or str(config.get("library_threshold_value", "") or "").strip() != normalized_library_text
+                or "media_flow_seed_check" not in config
+                or "force_hardlink_cleanup" not in config
+                or "clean_empty_media_dirs" not in config
+                or "empty_media_exts" not in config
+                or "path_block_keywords" not in config
+            ):
+                self.__update_config()
+
+        if self._clear_history:
+            for key in ["history", "run_history", "last_run_at", "daily_freed", "latest_usage", "retry_deadletter"]:
+                self.del_data(key=key)
+            self._clear_history = False
+            logger.info(f"{self.plugin_name}已清空历史数据")
+            self.__update_config()
+
+        if self._enabled or self._onlyonce:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+
+            if self._enabled and self._cron:
+                try:
+                    self._scheduler.add_job(
+                        func=self._task,
+                        trigger=CronTrigger.from_crontab(self._cron),
+                        name=self.plugin_name,
+                    )
+                    logger.info(f"{self.plugin_name}服务启动，周期：{self._cron}")
+                except Exception as err:
+                    logger.error(f"{self.plugin_name}定时任务配置错误：{err}")
+
+            if self._onlyonce:
+                logger.info(f"{self.plugin_name}服务启动，立即运行一次")
+                self._scheduler.add_job(
+                    func=self._task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name=f"{self.plugin_name}-once",
+                )
+                self._onlyonce = False
+                self.__update_config()
+
+            if self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        return [
+            {
+                "cmd": "/clean_local_disk",
+                "event": EventType.PluginAction,
+                "desc": "检查并清理本地磁盘",
+                "category": "磁盘管理",
+                "data": {"action": "clean_local_disk"},
+            }
+        ]
+
+    @eventmanager.register(EventType.PluginAction)
+    def handle_remote_command(self, event: Event):
+        if not event or not event.event_data:
+            return
+
+        event_data = event.event_data
+        if event_data.get("action") != "clean_local_disk":
+            return
+
+        channel = event_data.get("channel")
+        userid = event_data.get("user")
+        self.post_message(
+            channel=channel,
+            userid=userid,
+            title="🧹 磁盘清理：开始执行远程命令",
+        )
+        result = self._trigger_manual_clean()
+        self.post_message(
+            channel=channel,
+            userid=userid,
+            title="✅ 磁盘清理命令已受理" if result.get("success") else "⚠️ 磁盘清理命令未执行",
+            text=result.get("message"),
+        )
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/ack_risk_notice",
+                "endpoint": self.ack_risk_notice,
+                "methods": ["GET"],
+                "summary": "确认风险提示已阅读",
+                "description": "用户首次阅读风险提示后写入确认标记",
+            },
+            {
+                "path": "/clean",
+                "endpoint": self._trigger_manual_clean,
+                "methods": ["GET"],
+                "summary": "手动清理",
+                "description": "手动触发一次清理任务",
+            },
+            {
+                "path": "/logs",
+                "endpoint": self._tail_plugin_logs,
+                "methods": ["GET"],
+                "summary": "查看磁盘清理日志",
+                "description": "返回最近磁盘清理相关日志内容",
+            },
+        ]
+
+    def ack_risk_notice(self):
+        self.save_data("risk_notice_acked", True)
+        return {"success": True}
+
+    def _trigger_manual_clean(self):
+        if self._lock.locked():
+            return {"success": False, "message": "任务正在执行中，请稍后重试"}
+
+        def _runner():
+            try:
+                self._task(manual_run=True)
+            except Exception as err:
+                logger.error(f"{self.plugin_name}手动触发执行失败：{err}", exc_info=True)
+
+        threading.Thread(
+            target=_runner,
+            name=f"{self.__class__.__name__}-manual-run",
+            daemon=True,
+        ).start()
+        return {"success": True, "message": "已触发手动清理任务，请稍后刷新查看结果"}
+
+    def _tail_plugin_logs(self):
+        log_file = Path(settings.LOG_PATH) / "moviepilot.log"
+        if not log_file.exists():
+            return PlainTextResponse("日志文件不存在", status_code=404)
+
+        keywords = [self.plugin_name, self.__class__.__name__, "diskcleaner", "DiskCleaner"]
+        lines = deque(maxlen=200)
+        try:
+            with log_file.open("r", encoding="utf-8", errors="ignore") as fp:
+                for line in fp:
+                    if any((kw and kw in line) for kw in keywords):
+                        lines.append(line.rstrip("\n"))
+        except Exception as err:
+            return PlainTextResponse(f"读取日志失败：{err}", status_code=500)
+
+        if not lines:
+            return PlainTextResponse("暂无磁盘清理相关日志")
+        return PlainTextResponse("\n".join(lines))
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        downloader_items = [
+            {"title": conf.name, "value": conf.name}
+            for conf in DownloaderHelper().get_configs().values()
+        ]
+        media_items = [
+            {"title": conf.name, "value": conf.name}
+            for conf in MediaServerHelper().get_configs().values() if conf.name
+        ]
+        media_library_items = self._media_library_items(server_filters=self._effective_media_servers())
+        risk_notice_acked = bool(self.get_data("risk_notice_acked"))
+        risk_notice_shown_once = bool(self.get_data("risk_notice_shown_once"))
+        show_risk_notice = not risk_notice_acked and not risk_notice_shown_once
+        if show_risk_notice:
+            # 兜底：首次进入配置页后不再重复弹窗，避免前端事件异常导致反复提示
+            self.save_data("risk_notice_shown_once", True)
+        risk_notice_ack_api = f"/api/v1/plugin/{self.__class__.__name__}/ack_risk_notice?apikey={settings.API_TOKEN}"
+        manual_clean_api = f"/api/v1/plugin/{self.__class__.__name__}/clean?apikey={settings.API_TOKEN}"
+        delete_module = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "text": "删除动作将按触发流程串行执行。建议保留“删除整理记录/下载记录”，避免重复命中历史数据。",
+                    "class": "mb-2",
+                },
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_media_data", "label": "删除媒体数据"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_scrape_data", "label": "删除刮削数据"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_transfer_history", "label": "删除整理记录"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_download_history", "label": "删除下载记录"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 12, "class": "d-flex align-center flex-nowrap"},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "density": "compact",
+                                    "class": "text-no-wrap",
+                                    "model": "force_hardlink_cleanup",
+                                    "label": "检查硬链接并强制删除",
+                                },
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-warning text-no-wrap ml-2"},
+                                "text": "⚠️ 危险操作：慎重开启。开启后会检查硬链接并强制删除磁盘对应文件，即使未开启“同步删除文件”，也可能删除做种文件。",
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_empty_media_dirs", "label": "删除空媒体目录"}}],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextarea",
+                                "props": {
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "model": "empty_media_exts",
+                                    "label": "空目录检查媒体扩展名",
+                                    "rows": 2,
+                                    "placeholder": "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v",
+                                },
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                "text": "按逗号分隔；目录及其子目录不包含这些扩展名文件时，将删除该目录。",
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [{"component": "VTextarea", "props": {"density": "compact", "hideDetails": True, "model": "path_blocklist", "label": "禁止删除路径（黑名单）", "rows": 2, "placeholder": "一行一个路径；命中后永不删除"}}],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextarea",
+                                "props": {
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "model": "path_block_keywords",
+                                    "label": "禁止删除关键词",
+                                    "rows": 2,
+                                    "placeholder": "多个关键词用逗号或换行分隔；路径命中任一关键词即整条跳过",
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+        ]
+
+        media_module = [
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_library", "label": "启用媒体库空间告警"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "library_threshold_mode", "label": "媒体库告警方式", "items": [{"title": "按剩余容量（如 100G）", "value": "size"}, {"title": "按剩余比例（如 10%）", "value": "percent"}]}}],
+                    },
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "library_threshold_value", "label": "媒体库告警阈值", "placeholder": "支持 100G 或 10%"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "chips": True, "multiple": True, "clearable": True, "model": "media_servers", "label": "媒体服务器(多选)", "items": media_items}}],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "chips": True, "multiple": True, "clearable": True, "model": "media_libraries", "label": "媒体库(多选)", "items": media_library_items}}],
+                    },
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "protect_recent_days", "label": "近期入库保护(天)"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "prefer_playback_history", "label": "优先按播放历史判定老化"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VSelect",
+                                "props": {
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "model": "media_cleanup_priority",
+                                    "label": "优先删除类型",
+                                    "items": [
+                                        {"title": "电影（默认）", "value": "movie"},
+                                        {"title": "电视剧", "value": "tv"},
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "density": "compact",
+                                    "model": "tv_complete_only",
+                                    "label": "仅清理已完结电视剧",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextarea",
+                                "props": {
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "model": "media_path_mapping",
+                                    "label": "媒体路径映射(媒体服务器路径:MoviePilot路径)",
+                                    "rows": 2,
+                                    "placeholder": "一行一个映射，如 /data:/mnt/link；路径一致可留空",
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-2"},
+                "content": [
+                    {"component": "div", "text": "阈值填写示例：按容量填 100G（默认）；按比例填 10%（建议）"},
+                    {"component": "div", "text": "路径映射示例：Emby /data/A.mp4，MP /mnt/link/A.mp4"},
+                    {"component": "div", "text": "映射填写：/data:/mnt/link；配置错误会导致无法命中MP整理记录"},
+                    {"component": "div", "text": "媒体服务器与媒体库留空代表不过滤；选中后仅在选中范围内监听、删除和刷新"},
+                    {"component": "div", "text": "启用“仅清理已完结电视剧”后，仅清理 TMDB 状态为完结/取消的电视剧"},
+                ],
+            },
+        ]
+
+        downloader_module = [
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "clean_downloader_seed", "label": "删除做种"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "delete_downloader_files", "label": "同步删除文件"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "media_flow_seed_check", "label": "媒体流程删种校验做种时长"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_download", "label": "启用下载目录空间告警"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "download_threshold_mode", "label": "下载目录告警方式", "items": [{"title": "按剩余容量（如 100G）", "value": "size"}, {"title": "按剩余比例（如 10%）", "value": "percent"}]}}],
+                    },
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "download_threshold_value", "label": "下载目录告警阈值", "placeholder": "支持 100G 或 10%"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "monitor_downloader", "label": "监听下载器做种时长(独立触发)"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "seeding_days", "label": "做种时长阈值(天，按完成时间计算)"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "chips": True, "multiple": True, "clearable": True, "model": "downloaders", "label": "下载器(多选)", "items": downloader_items}}],
+                    },
+                ],
+            },
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-2"},
+                "content": [
+                    {"component": "div", "text": "阈值填写示例：按容量填 100G（默认）；按比例填 10%（建议）"},
+                    {"component": "div", "text": "做种时长按完成时间计算；仅在“监听下载器做种时长”开启时生效"},
+                ],
+            },
+        ]
+
+        post_module = [
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "refresh_mediaserver", "label": "清理后刷新媒体库"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
+                        "content": [{"component": "VSelect", "props": {"density": "compact", "hideDetails": True, "model": "refresh_mode", "label": "媒体库刷新方式", "items": [{"title": "定向刷新(优先)", "value": "item"}, {"title": "整库刷新", "value": "root"}]}}],
+                    },
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "refresh_batch_size", "label": "刷新批次大小"}}]},
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "媒体目录空间统计与清理始终按本地媒体库目录执行；媒体服务器/媒体库选择仅用于刷新目标"}}],
+                    },
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"density": "compact", "model": "enable_retry_queue", "label": "启用失败补偿重试"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "retry_max_attempts", "label": "最大重试次数"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "retry_interval_minutes", "label": "重试间隔(分钟)"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "retry_batch_size", "label": "单轮补偿处理数"}}]},
+                ],
+            },
+        ]
+
+        manual_button_injector = [
+            {
+                "component": "div",
+                "props": {
+                    "onVnodeMounted": (
+                        "function(){ "
+                        "if (window.__diskCleanerManualButtonWatcher) { "
+                        "clearInterval(window.__diskCleanerManualButtonWatcher); "
+                        "} "
+                        f"var cleanApi = '{manual_clean_api}'; "
+                        "var ensure = function(){ "
+                        "var findBtn = function(label){ "
+                        "var nodes = Array.from(document.querySelectorAll('button, .v-btn')); "
+                        "for (var i = nodes.length - 1; i >= 0; i--) { "
+                        "var n = nodes[i]; "
+                        "if (!n || !n.offsetParent) { continue; } "
+                        "var t = ((n.innerText || n.textContent || '')).replace(/\\s+/g, ''); "
+                        "if (t.indexOf(label) !== -1) { "
+                        "return (n.classList && n.classList.contains('v-btn')) ? n : ((n.closest && n.closest('.v-btn')) || n); "
+                        "} "
+                        "} "
+                        "return null; "
+                        "}; "
+                        "var saveBtn = findBtn('保存'); "
+                        "if (!saveBtn || !saveBtn.parentElement) { return; } "
+                        "if (document.getElementById('diskcleaner-manual-clean-save-btn')) { return; } "
+                        "var btn = document.createElement('button'); "
+                        "btn.id = 'diskcleaner-manual-clean-save-btn'; "
+                        "btn.type = 'button'; "
+                        "btn.className = saveBtn.className; "
+                        "btn.style.marginRight = '8px'; "
+                        "btn.innerText = '立即清理'; "
+                        "btn.onclick = function(e){ "
+                        "if (e) { e.preventDefault(); e.stopPropagation(); } "
+                        "fetch(cleanApi).catch(function(){}); "
+                        "}; "
+                        "saveBtn.parentElement.insertBefore(btn, saveBtn); "
+                        "}; "
+                        "window.__diskCleanerManualButtonWatcher = setInterval(ensure, 300); "
+                        "ensure(); "
+                        "}"
+                    ),
+                    "onVnodeBeforeUnmount": (
+                        "function(){ "
+                        "if (window.__diskCleanerManualButtonWatcher) { "
+                        "clearInterval(window.__diskCleanerManualButtonWatcher); "
+                        "window.__diskCleanerManualButtonWatcher = null; "
+                        "} "
+                        "var btn = document.getElementById('diskcleaner-manual-clean-save-btn'); "
+                        "if (btn && btn.parentElement) { "
+                        "btn.parentElement.removeChild(btn); "
+                        "} "
+                        "}"
+                    ),
+                },
+            }
+        ]
+
+        warning_prefix = []
+        if show_risk_notice:
+            warning_prefix = [
+                {
+                    "component": "div",
+                    "props": {
+                        "onVnodeMounted": (
+                            "function(){ "
+                            "risk_notice_dialog = true; "
+                            "risk_notice_countdown = 5; "
+                            "if (window.__diskCleanerRiskTimer) { clearInterval(window.__diskCleanerRiskTimer); } "
+                            "window.__diskCleanerRiskTimer = setInterval(function(){ "
+                            "if ((risk_notice_countdown || 0) > 0) { risk_notice_countdown = (risk_notice_countdown || 0) - 1; } "
+                            "if ((risk_notice_countdown || 0) <= 0) { "
+                            "clearInterval(window.__diskCleanerRiskTimer); "
+                            "window.__diskCleanerRiskTimer = null; "
+                            "} "
+                            "}, 1000); "
+                            "}"
+                        ),
+                        "onVnodeBeforeUnmount": (
+                            "function(){ "
+                            "if (window.__diskCleanerRiskTimer) { "
+                            "clearInterval(window.__diskCleanerRiskTimer); "
+                            "window.__diskCleanerRiskTimer = null; "
+                            "} "
+                            "}"
+                        ),
+                    },
+                },
+                {
+                    "component": "VDialog",
+                    "props": {
+                        "model": "risk_notice_dialog",
+                        "persistent": True,
+                        "max-width": "52rem",
+                        "scrollable": True,
+                    },
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"variant": "elevated"},
+                            "content": [
+                                {
+                                    "component": "VCardTitle",
+                                    "content": [
+                                        {
+                                            "component": "VRow",
+                                            "props": {"class": "align-center", "noGutters": True},
+                                            "content": [
+                                                {
+                                                    "component": "VCol",
+                                                    "props": {"cols": 12, "md": 8},
+                                                    "content": [
+                                                        {"component": "div", "text": "使用警告（请先阅读 5 秒）"},
+                                                        {"component": "div", "props": {"class": "text-caption"}, "text": "使用文档（含三种模式流程图与判断关系）"},
+                                                    ],
+                                                },
+                                                {
+                                                    "component": "VCol",
+                                                    "props": {"cols": 12, "md": 4, "class": "d-flex justify-md-end mt-2 mt-md-0"},
+                                                    "content": [
+                                                        {
+                                                            "component": "VBtn",
+                                                            "props": {
+                                                                "size": "small",
+                                                                "variant": "outlined",
+                                                                "color": "primary",
+                                                                "href": self.plugin_doc_url,
+                                                                "target": "_blank",
+                                                            },
+                                                            "text": "打开使用文档",
+                                                        }
+                                                    ],
+                                                },
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {"component": "VDivider"},
+                                {
+                                    "component": "VCardText",
+                                    "content": [
+                                        {
+                                            "component": "VAlert",
+                                            "props": {
+                                                "type": "warning",
+                                                "variant": "tonal",
+                                                "density": "compact",
+                                                "text": "该插件为个人自用插件。自用场景：下载后硬链接整理到本地，再同步上传 115；目的是清理本地无效媒体信息。当前版本未做完整测试，建议暂时不要在生产库启用。",
+                                            },
+                                        },
+                                        {"component": "div", "props": {"class": "text-caption mt-2"}, "text": "倒计时结束后才可点击“我已阅读，继续配置”"},
+                                        {
+                                            "component": "VProgressLinear",
+                                            "props": {
+                                                "class": "mt-2",
+                                                "modelValue": "{{ (5 - (risk_notice_countdown || 0)) * 20 }}",
+                                                "height": 8,
+                                                "rounded": True,
+                                                "striped": True,
+                                                "stream": True,
+                                                "color": "warning",
+                                            },
+                                        },
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "class": "mt-2",
+                                                "density": "compact",
+                                                "hideDetails": True,
+                                                "readonly": True,
+                                                "model": "risk_notice_countdown",
+                                                "label": "剩余阅读时间（秒）",
+                                            },
+                                        },
+                                    ],
+                                },
+                                {"component": "VDivider"},
+                                {
+                                    "component": "VCardActions",
+                                    "content": [
+                                        {"component": "VSpacer"},
+                                        {
+                                            "component": "VBtn",
+                                            "props": {
+                                                "color": "warning",
+                                                "variant": "flat",
+                                                "disabled": "{{ (risk_notice_countdown || 0) > 0 }}",
+                                                "onClick": (
+                                                    "function(){ "
+                                                    "if ((risk_notice_countdown || 0) <= 0) { "
+                                                    f"fetch('{risk_notice_ack_api}').catch(function(){{}}); "
+                                                    "risk_notice_dialog = false; "
+                                                    "} "
+                                                    "}"
+                                                ),
+                                            },
+                                            "text": "我已阅读，继续配置",
+                                        },
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                },
+            ]
+
+        return manual_button_injector + warning_prefix + [
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "content": [
+                            {
+                                "component": "VRow",
+                                "props": {"class": "align-center", "noGutters": True},
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 8},
+                                        "content": [{"component": "div", "text": "基础设置"}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 4, "class": "d-flex justify-md-end mt-2 mt-md-0"},
+                                        "content": [
+                                            {
+                                                "component": "VBtn",
+                                                "props": {
+                                                    "size": "small",
+                                                    "variant": "outlined",
+                                                    "color": "primary",
+                                                    "href": self.plugin_doc_url,
+                                                    "target": "_blank",
+                                                },
+                                                "text": "打开使用文档",
+                                            }
+                                        ],
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                    {"component": "VDivider"},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "onVnodeMounted": (
+                                        "function(){ "
+                                        "if (window.__diskCleanerThresholdWatcher) { clearInterval(window.__diskCleanerThresholdWatcher); } "
+                                        "window.__diskCleanerPrevLibraryMode = (library_threshold_mode || 'size'); "
+                                        "window.__diskCleanerPrevDownloadMode = (download_threshold_mode || 'size'); "
+                                        "window.__diskCleanerThresholdWatcher = setInterval(function(){ "
+                                        "var lm = (library_threshold_mode || 'size'); "
+                                        "var dm = (download_threshold_mode || 'size'); "
+                                        "if (lm !== window.__diskCleanerPrevLibraryMode) { "
+                                        "library_threshold_value = (lm === 'percent') ? '10%' : '100G'; "
+                                        "window.__diskCleanerPrevLibraryMode = lm; "
+                                        "} "
+                                        "if (dm !== window.__diskCleanerPrevDownloadMode) { "
+                                        "download_threshold_value = (dm === 'percent') ? '10%' : '100G'; "
+                                        "window.__diskCleanerPrevDownloadMode = dm; "
+                                        "} "
+                                        "}, 300); "
+                                        "}"
+                                    ),
+                                    "onVnodeBeforeUnmount": (
+                                        "function(){ "
+                                        "if (window.__diskCleanerThresholdWatcher) { "
+                                        "clearInterval(window.__diskCleanerThresholdWatcher); "
+                                        "window.__diskCleanerThresholdWatcher = null; "
+                                        "} "
+                                        "}"
+                                    ),
+                                },
+                            },
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "info",
+                                    "variant": "tonal",
+                                    "density": "compact",
+                                    "text": "先选触发流程，再配置各模块参数；删除会按所选链路串行执行。",
+                                    "class": "mb-2",
+                                },
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12},
+                                        "content": [
+                                            {
+                                                "component": "VSelect",
+                                                "props": {
+                                                    "density": "compact",
+                                                    "hideDetails": True,
+                                                    "model": "trigger_flow",
+                                                    "label": "触发流程（单选）",
+                                                    "items": [
+                                                        {
+                                                            "title": "1. 媒体优先（推荐）",
+                                                            "value": "flow_library_mp_downloader",
+                                                        },
+                                                        {
+                                                            "title": "2. 下载器优先",
+                                                            "value": "flow_downloader_mp_library",
+                                                        },
+                                                        {
+                                                            "title": "3. 整理记录优先",
+                                                            "value": "flow_transfer_oldest",
+                                                        },
+                                                    ],
+                                                },
+                                            }
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "info",
+                                    "variant": "tonal",
+                                    "density": "compact",
+                                    "class": "mt-2",
+                                },
+                                "content": [
+                                    {"component": "div", "text": "流程说明："},
+                                    {"component": "div", "text": "1）媒体优先：媒体目录阈值 -> 优先联动 MP/下载器（缺失时仅删本地）"},
+                                    {"component": "div", "text": "2）下载器优先：下载器阈值/做种时长 -> MP 整理记录 -> 媒体数据"},
+                                    {"component": "div", "text": "3）整理记录优先：MP 整理记录（旧到新） -> 媒体数据 + 下载器做种"},
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "enabled", "label": "启用"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "notify", "label": "通知"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "dry_run", "label": "演练"}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3}, "content": [{"component": "VSwitch", "props": {"density": "compact", "class": "text-no-wrap", "model": "clear_history", "label": "清空历史"}}]},
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 6},
+                                        "content": [{"component": "VCronField", "props": {"density": "compact", "hideDetails": True, "model": "cron", "label": "执行周期", "placeholder": "0 */8 * * *"}}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 6},
+                                        "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "cooldown_minutes", "label": "冷却时间(分钟)"}}],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "max_delete_items", "label": "单轮最多处理条目"}}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "max_gb_per_run", "label": "单轮最多释放(GB)"}}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12, "md": 4},
+                                        "content": [{"component": "VTextField", "props": {"density": "compact", "hideDetails": True, "model": "max_gb_per_day", "label": "每日最多释放(GB)"}}],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined"},
+                "content": [
+                    {
+                        "component": "VTabs",
+                        "props": {"model": "tab", "grow": True, "color": "primary"},
+                        "content": [
+                            {"component": "VTab", "props": {"value": "tab-delete"}, "text": "删除设置"},
+                            {"component": "VTab", "props": {"value": "tab-media"}, "text": "媒体库设置"},
+                            {"component": "VTab", "props": {"value": "tab-downloader"}, "text": "下载器设置"},
+                            {"component": "VTab", "props": {"value": "tab-post"}, "text": "删除后处理"},
+                        ],
+                    },
+                    {"component": "VDivider"},
+                    {
+                        "component": "VWindow",
+                        "props": {"model": "tab"},
+                        "content": [
+                            {"component": "VWindowItem", "props": {"value": "tab-delete"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": delete_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-media"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": media_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-downloader"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": downloader_module}]},
+                            {"component": "VWindowItem", "props": {"value": "tab-post"}, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": post_module}]},
+                        ],
+                    },
+                ],
+            },
+        ], {
+            "enabled": False,
+            "notify": False,
+            "onlyonce": False,
+            "clear_history": False,
+            "dry_run": True,
+            "force_hardlink_cleanup": False,
+            "tab": "tab-delete",
+            "cron": "0 */8 * * *",
+            "cooldown_minutes": 60,
+            "trigger_flow": "flow_library_mp_downloader",
+            "monitor_download": True,
+            "monitor_library": True,
+            "monitor_downloader": False,
+            "download_threshold_mode": "size",
+            "download_threshold_value": "100G",
+            "library_threshold_mode": "size",
+            "library_threshold_value": "100G",
+            "media_servers": [],
+            "media_libraries": [],
+            "downloaders": [],
+            "seeding_days": 15,
+            "media_flow_seed_check": True,
+            "max_delete_items": 5,
+            "max_gb_per_run": 50,
+            "max_gb_per_day": 200,
+            "protect_recent_days": 30,
+            "media_cleanup_priority": "movie",
+            "tv_complete_only": True,
+            "clean_media_data": True,
+            "clean_scrape_data": True,
+            "clean_downloader_seed": False,
+            "delete_downloader_files": False,
+            "clean_transfer_history": True,
+            "clean_download_history": True,
+            "clean_empty_media_dirs": True,
+            "empty_media_exts": "mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v",
+            "prefer_playback_history": True,
+            "media_path_mapping": "",
+            "path_allowlist": "",
+            "path_blocklist": "",
+            "path_block_keywords": "",
+            "refresh_mediaserver": False,
+            "refresh_mode": "item",
+            "refresh_batch_size": 20,
+            "enable_retry_queue": True,
+            "retry_max_attempts": 3,
+            "retry_interval_minutes": 30,
+            "retry_batch_size": 5,
+            "risk_notice_dialog": False,
+            "risk_notice_countdown": 0,
+        }
+
+    def get_page(self) -> List[dict]:
+        manual_clean_event_api = f"plugin/{self.__class__.__name__}/clean"
+        usage = self._collect_monitor_usage()
+        all_runs = self._collect_run_history()
+        recent_runs = all_runs[:10]
+        run_stats = self._build_run_stats(all_runs)
+        usage_download = usage.get("download", {})
+        usage_library = usage.get("library", {})
+        daily_freed_bytes = self._get_daily_freed_bytes()
+        daily_limit_bytes = int(self._max_gb_per_day * (1024 ** 3)) if self._max_gb_per_day > 0 else 0
+        daily_percent = min(100, int(daily_freed_bytes * 100 / daily_limit_bytes)) if daily_limit_bytes else 0
+        last_run_text = str(run_stats.get("last_run_at", "-") or "-")
+        if len(last_run_text) > 16:
+            last_run_text = last_run_text[-16:]
+
+        overview_tiles = [
+            self._build_metric_tile(
+                title="任务执行次数",
+                value=str(run_stats.get("total_runs", 0)),
+                subtitle=f"完{run_stats.get('completed_runs', 0)} 跳{run_stats.get('skipped_runs', 0)} 异{run_stats.get('failed_runs', 0)}",
+                color="primary",
+                icon="mdi-playlist-check",
+            ),
+            self._build_metric_tile(
+                title="累计删除条目",
+                value=str(run_stats.get("total_actions", 0)),
+                subtitle=f"最近 {last_run_text}",
+                color="info",
+                icon="mdi-delete-sweep",
+            ),
+            self._build_metric_tile(
+                title="累计释放空间",
+                value=self._format_size(int(run_stats.get("total_freed_bytes", 0) or 0)),
+                subtitle=f"均值 {self._format_size(int(run_stats.get('avg_freed_bytes', 0) or 0))}",
+                color="success",
+                icon="mdi-harddisk-plus",
+            ),
+        ]
+
+        usage_cards = [
+            self._build_usage_card(
+                title="资源目录",
+                usage=usage_download,
+                enabled=self._monitor_download,
+                mode=self._download_threshold_mode,
+                value=self._download_threshold_value,
+            ),
+            self._build_usage_card(
+                title="媒体库目录",
+                usage=usage_library,
+                enabled=self._monitor_library,
+                mode=self._library_threshold_mode,
+                value=self._library_threshold_value,
+            ),
+        ]
+
+        history_cards = []
+        if not recent_runs:
+            history_cards = [
+                {
+                    "component": "VAlert",
+                    "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "暂无任务执行记录"},
+                }
+            ]
+        else:
+            for index, run in enumerate(recent_runs, 1):
+                status_type, status_text = self._run_status_info(run.get("status"))
+                detail_items = run.get("items") or []
+                detail_content = []
+                if detail_items:
+                    for seq, item in enumerate(detail_items[:8], 1):
+                        detail_content.append(
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                                "text": (
+                                    f"{seq}. {item.get('trigger', '-')} | {item.get('target', '-')} | "
+                                    f"{item.get('action', '-')} | 释放 {self._format_size(int(item.get('freed_bytes', 0) or 0))} | "
+                                    f"{self._step_result_text(item.get('steps'))}"
+                                ),
+                            }
+                        )
+                    if len(detail_items) > 8:
+                        detail_content.append(
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": f"... 其余 {len(detail_items) - 8} 条明细已折叠",
+                            }
+                        )
+                else:
+                    detail_content.append(
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis"},
+                            "text": "本轮无删除明细（阈值未命中/冷却命中/仅补偿检查）",
+                        }
+                    )
+
+                history_cards.append({
+                    "component": "VCard",
+                    "props": {"class": "mb-2", "variant": "tonal"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "py-1 px-2"},
+                            "content": [
+                                {
+                                    "component": "VRow",
+                                    "props": {"align": "center", "noGutters": True},
+                                    "content": [
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 8},
+                                            "content": [
+                                                {
+                                                    "component": "div",
+                                                    "props": {"class": "text-caption font-weight-bold text-truncate"},
+                                                    "text": f"#{index} {run.get('time', '-')}",
+                                                }
+                                            ],
+                                        },
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 4, "class": "text-right"},
+                                            "content": [
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {"size": "x-small", "color": status_type, "variant": "tonal"},
+                                                    "text": status_text,
+                                                }
+                                            ],
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                                    "text": (
+                                        f"{run.get('flow_text', self._trigger_flow_label())} | "
+                                        f"备注：{run.get('reason', '-') or '-'}"
+                                    ),
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption mt-1 text-truncate"},
+                                    "text": (
+                                        f"处理 {int(run.get('action_count', 0) or 0)} 条 | "
+                                        f"释放 {self._format_size(int(run.get('freed_bytes', 0) or 0))} | "
+                                        f"模式 {run.get('mode', '-')} | "
+                                        f"触发 {','.join(run.get('triggers') or ['-'])}"
+                                    ),
+                                },
+                                {"component": "div", "props": {"class": "mt-1"}, "content": detail_content},
+                            ],
+                        },
+                    ],
+                })
+
+        return [
+            {
+                "component": "VBtn",
+                "props": {
+                    "id": "diskcleaner-manual-clean-fixed-btn",
+                    "variant": "elevated",
+                    "color": "success",
+                    "style": "position:fixed; right:96px; bottom:24px; z-index:2147483000; min-height:40px; border-radius:12px; font-weight:600;",
+                },
+                "events": {
+                    "click": {
+                        "api": manual_clean_event_api,
+                        "method": "GET",
+                        "params": {"apikey": settings.API_TOKEN},
+                    }
+                },
+                "text": "立即清理",
+            },
+            {
+                "component": "VCard",
+                "props": {"class": "mb-1", "variant": "outlined"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "py-1 px-2"},
+                        "content": [
+                            {
+                                "component": "VRow",
+                                "props": {"align": "center", "noGutters": True},
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 8},
+                                        "content": [{"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "运行总览"}],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 4, "class": "text-right"},
+                                        "content": [
+                                            {
+                                                "component": "VBtn",
+                                                "props": {
+                                                    "id": "diskcleaner-manual-clean-overview-btn",
+                                                    "size": "x-small",
+                                                    "variant": "tonal",
+                                                    "color": "error",
+                                                },
+                                                "events": {
+                                                    "click": {
+                                                        "api": manual_clean_event_api,
+                                                        "method": "GET",
+                                                        "params": {"apikey": settings.API_TOKEN},
+                                                    }
+                                                },
+                                                "text": "立即清理",
+                                            }
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": f"流程：{self._trigger_flow_label()} | 冷却：{self._cooldown_minutes} 分钟 | 单轮：{self._max_delete_items} 条 / {self._max_gb_per_run} GB",
+                            },
+                            {
+                                "component": "VRow",
+                                "props": {"class": "mt-1"},
+                                "content": overview_tiles,
+                            },
+                            {
+                                "component": "VRow",
+                                "props": {"align": "center", "noGutters": True},
+                                "content": [
+                                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "div", "props": {"class": "text-caption"}, "text": f"当日释放 {self._format_size(daily_freed_bytes)} / {self._max_gb_per_day} GB"}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VProgressLinear", "props": {"modelValue": daily_percent, "height": 4, "rounded": True, "striped": True, "stream": True, "color": "warning"}}]},
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"class": "mb-1", "variant": "outlined"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "py-1 px-2"},
+                        "content": [
+                            {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "空间监控"},
+                            {"component": "VRow", "props": {"class": "mt-1"}, "content": usage_cards},
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined"},
+                "content": [
+                    {"component": "VCardTitle", "text": "任务执行历史（最近10轮）"},
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "props": {"class": "py-1 px-2"}, "content": history_cards},
+                ],
+            },
+        ]
+
+    def _collect_run_history(self) -> List[dict]:
+        run_history = self.get_data("run_history") or []
+        if not run_history:
+            run_history = self._build_run_history_from_actions(self.get_data("history") or [])
+        return sorted(run_history, key=lambda x: x.get("time", ""), reverse=True)
+
+    def _build_run_history_from_actions(self, actions: List[dict]) -> List[dict]:
+        if not actions:
+            return []
+        grouped: Dict[str, dict] = {}
+        for action in actions:
+            time_text = action.get("time") or "-"
+            group = grouped.setdefault(
+                time_text,
+                {
+                    "run_id": f"legacy-{time_text}",
+                    "time": time_text,
+                    "status": "completed",
+                    "reason": "历史记录自动聚合",
+                    "flow": self._trigger_flow,
+                    "flow_text": self._trigger_flow_label(),
+                    "mode": action.get("mode", "apply"),
+                    "action_count": 0,
+                    "freed_bytes": 0,
+                    "triggers": [],
+                    "items": [],
+                },
+            )
+            group["action_count"] += 1
+            group["freed_bytes"] += int(action.get("freed_bytes", 0) or 0)
+            trigger = action.get("trigger")
+            if trigger and trigger not in group["triggers"]:
+                group["triggers"].append(trigger)
+            group["items"].append(
+                {
+                    "time": action.get("time"),
+                    "trigger": trigger,
+                    "target": action.get("target"),
+                    "action": action.get("action"),
+                    "freed_bytes": int(action.get("freed_bytes", 0) or 0),
+                    "mode": action.get("mode"),
+                    "steps": action.get("steps") or {},
+                }
+            )
+        return list(grouped.values())
+
+    def _build_run_stats(self, run_history: List[dict]) -> dict:
+        total_runs = len(run_history)
+        total_actions = sum(int(item.get("action_count", 0) or 0) for item in run_history)
+        total_freed = sum(int(item.get("freed_bytes", 0) or 0) for item in run_history)
+        completed_runs = len([item for item in run_history if item.get("status") == "completed"])
+        skipped_runs = len([item for item in run_history if item.get("status") in {"skipped", "idle"}])
+        failed_runs = len([item for item in run_history if item.get("status") == "failed"])
+        avg_freed = int(total_freed / total_runs) if total_runs else 0
+        return {
+            "total_runs": total_runs,
+            "completed_runs": completed_runs,
+            "skipped_runs": skipped_runs,
+            "failed_runs": failed_runs,
+            "total_actions": total_actions,
+            "total_freed_bytes": total_freed,
+            "avg_freed_bytes": avg_freed,
+            "last_run_at": run_history[0].get("time") if run_history else (self.get_data("last_run_at") or "-"),
+        }
+
+    @staticmethod
+    def _build_metric_tile(
+        title: str,
+        value: str,
+        subtitle: str,
+        color: str = "primary",
+        icon: str = "mdi-chart-box-outline",
+    ) -> dict:
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 4},
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "color": color, "class": "h-100"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "py-2 px-2"},
+                            "content": [
+                                {
+                                    "component": "VRow",
+                                    "props": {"class": "ma-0", "align": "center", "noGutters": True},
+                                    "content": [
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 7},
+                                            "content": [
+                                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis text-truncate"}, "text": title}
+                                            ],
+                                        },
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 5, "class": "text-right"},
+                                            "content": [{"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "·"}],
+                                        },
+                                    ],
+                                },
+                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1 text-truncate"}, "text": subtitle},
+                                {"component": "div", "props": {"class": "text-body-2 font-weight-bold text-truncate mt-1"}, "text": value},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+    @staticmethod
+    def _run_status_info(status: Optional[str]) -> Tuple[str, str]:
+        mapping = {
+            "completed": ("success", "执行完成"),
+            "skipped": ("warning", "已跳过"),
+            "idle": ("info", "无需清理"),
+            "failed": ("error", "执行异常"),
+        }
+        return mapping.get(status or "", ("info", str(status or "未知状态")))
+
+    @staticmethod
+    def _step_result_text(steps: Optional[dict]) -> str:
+        if not steps:
+            return "-"
+        step_name_map = {
+            "media": "媒体",
+            "scrape": "刮削",
+            "downloader": "下载器",
+            "transfer_history": "整理记录",
+            "download_history": "下载记录",
+        }
+        parts = []
+        for key, value in steps.items():
+            planned = int((value or {}).get("planned", 0) or 0)
+            done = int((value or {}).get("done", 0) or 0)
+            failed = int((value or {}).get("failed", 0) or 0)
+            label = step_name_map.get(key, key)
+            parts.append(f"{label}:{done}/{planned}{'(失败'+str(failed)+')' if failed else ''}")
+        return "; ".join(parts) if parts else "-"
+
+    def _action_reason_text(self, action: dict, usage: Optional[dict] = None) -> str:
+        trigger = str((action or {}).get("trigger") or "").strip()
+        if not trigger:
+            return "命中清理规则"
+        if trigger.startswith("失败补偿"):
+            return "前序步骤失败后进入补偿队列重试"
+        if "流程1" in trigger:
+            return (
+                f"媒体库目录命中阈值（{self._threshold_text(self._library_threshold_mode, self._library_threshold_value)}），"
+                "按最旧媒体候选清理"
+            )
+        if "流程2" in trigger:
+            if "做种阈值" in trigger:
+                return f"下载器做种时长达到阈值（{self._seeding_days} 天）"
+            return (
+                f"资源目录命中阈值（{self._threshold_text(self._download_threshold_mode, self._download_threshold_value)}），"
+                "按下载器候选清理"
+            )
+        if "流程3" in trigger:
+            reasons = self._flow3_trigger_reasons(usage or {}) if usage else []
+            if reasons:
+                return f"触发条件：{'/'.join(reasons)}；按整理记录从旧到新清理"
+            return "按整理记录从旧到新清理"
+        return trigger
+
+    def _log_action_details(self, actions: List[dict], usage: Optional[dict]):
+        if not actions:
+            return
+        logger.info(f"{self.plugin_name}本轮清理明细开始（共 {len(actions)} 条）")
+        mode_text = "预计" if self._dry_run else "实际"
+        for index, item in enumerate(actions, 1):
+            reason_text = self._action_reason_text(item, usage=usage)
+            logger.info(
+                f"{self.plugin_name}清理明细[{index}/{len(actions)}] "
+                f"目标={item.get('target') or '-'} | "
+                f"原因={reason_text} | "
+                f"触发={item.get('trigger') or '-'} | "
+                f"执行={item.get('action') or '-'} | "
+                f"步骤={self._step_result_text(item.get('steps'))} | "
+                f"{mode_text}释放={self._format_size(int(item.get('freed_bytes', 0) or 0))}"
+            )
+        logger.info(f"{self.plugin_name}本轮清理明细结束")
+
+    def _record_dir_cleanup_item(self, bucket: Dict[str, bool], path: Path):
+        if not path:
+            return
+        try:
+            bucket[Path(path).as_posix()] = True
+        except Exception:
+            return
+
+    def _log_dir_cleanup_summary(self):
+        empty_dirs = list((self._current_run_empty_dirs_deleted or {}).keys())
+        no_media_dirs = list((self._current_run_no_media_dirs_deleted or {}).keys())
+        no_media_checks = int(self._current_run_no_media_checks or 0)
+        dryrun_skips = int(self._current_run_dir_cleanup_dryrun_skips or 0)
+        if not empty_dirs and not no_media_dirs and no_media_checks <= 0 and dryrun_skips <= 0:
+            return
+        if self._dry_run and dryrun_skips > 0:
+            logger.info(
+                f"{self.plugin_name}目录回收汇总：演练模式已跳过目录回收检查 {dryrun_skips} 次，"
+                f"空目录/无媒体目录不执行实际删除"
+            )
+            return
+
+        logger.info(
+            f"{self.plugin_name}目录回收汇总：空目录删除 {len(empty_dirs)} 个 | "
+            f"无媒体目录检查 {no_media_checks} 次，命中删除 {len(no_media_dirs)} 个"
+        )
+        if empty_dirs:
+            logger.info(
+                f"{self.plugin_name}空目录删除清单："
+                f"{self._paths_preview_text(empty_dirs, limit=10)}"
+            )
+        if no_media_checks > 0:
+            if no_media_dirs:
+                logger.info(
+                    f"{self.plugin_name}无媒体目录删除清单："
+                    f"{self._paths_preview_text(no_media_dirs, limit=10)}"
+                )
+            else:
+                logger.info(f"{self.plugin_name}无媒体目录检查结果：未命中可删除目录")
+
+    @staticmethod
+    def _sanitize_for_json(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Enum):
+            enum_val = getattr(value, "value", None)
+            if isinstance(enum_val, (str, int, float, bool)) or enum_val is None:
+                return enum_val
+            return str(enum_val)
+        if isinstance(value, Path):
+            return value.as_posix()
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, dict):
+            return {str(k): DiskCleaner._sanitize_for_json(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [DiskCleaner._sanitize_for_json(item) for item in value]
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump(mode="json")
+                return DiskCleaner._sanitize_for_json(dumped)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _append_run_history(
+        self,
+        run_time: str,
+        usage: Optional[dict],
+        actions: List[dict],
+        freed_bytes: int,
+        status: str = "completed",
+        reason: str = "",
+    ):
+        run_history = self.get_data("run_history") or []
+        triggers = sorted({item.get("trigger") for item in actions if item.get("trigger")})
+        items = []
+        for item in actions[:100]:
+            items.append(
+                {
+                    "time": item.get("time"),
+                    "trigger": item.get("trigger"),
+                    "target": item.get("target"),
+                    "action": item.get("action"),
+                    "freed_bytes": int(item.get("freed_bytes", 0) or 0),
+                    "mode": item.get("mode"),
+                    "steps": item.get("steps") or {},
+                }
+            )
+        run_record = {
+            "run_id": f"{int(time.time() * 1000)}-{len(run_history) + 1}",
+            "time": run_time,
+            "status": status,
+            "reason": reason,
+            "flow": self._trigger_flow,
+            "flow_text": self._trigger_flow_label(),
+            "mode": "dry-run" if self._dry_run else "apply",
+            "action_count": len(actions),
+            "freed_bytes": int(freed_bytes or 0),
+            "triggers": triggers,
+            "usage": usage or {},
+            "items": items,
+        }
+        run_history.append(self._sanitize_for_json(run_record))
+        self.save_data("run_history", self._sanitize_for_json(run_history[-200:]))
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        return []
+
+    def stop_service(self):
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as err:
+            logger.error(f"{self.plugin_name}停止服务失败：{err}")
+
+    def _task(self, manual_run: bool = False):
+        with self._lock:
+            try:
+                if not self._transfer_oper:
+                    self._transfer_oper = TransferHistoryOper()
+                if not self._download_oper:
+                    self._download_oper = DownloadHistoryOper()
+                if not self._mediaserver_oper:
+                    self._mediaserver_oper = MediaServerOper()
+
+                run_source = "手动触发" if manual_run else "定时触发"
+                logger.info(f"{self.plugin_name}开始执行（{run_source}）")
+                run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._current_run_freed_bytes = 0
+                self._current_run_empty_dirs_deleted = {}
+                self._current_run_no_media_dirs_deleted = {}
+                self._current_run_no_media_checks = 0
+                self._current_run_dir_cleanup_dryrun_skips = 0
+                self._playback_ts_cache = {}
+                # 每轮重查未完结或暂时查询失败的剧集，后续定时任务才能感知状态变化。
+                self._tv_end_state_cache = {}
+                self._last_library_scan_summary = ""
+                self._last_library_scan_stats = {}
+                retry_actions: List[dict] = []
+                skip_normal_cleanup = False
+                if self._enable_retry_queue and not self._dry_run:
+                    retry_actions = self._process_retry_queue(limit=self._retry_batch_size)
+
+                if (not manual_run) and self._is_in_cooldown():
+                    if not retry_actions:
+                        logger.info(f"{self.plugin_name}命中冷却时间，跳过执行")
+                        self._append_run_history(
+                            run_time=run_time,
+                            usage=None,
+                            actions=[],
+                            freed_bytes=0,
+                            status="skipped",
+                            reason="命中冷却时间",
+                        )
+                        return
+                    logger.info(f"{self.plugin_name}命中冷却时间，仅执行失败补偿")
+                    skip_normal_cleanup = True
+
+                if (not manual_run) and (not self._dry_run) and self._is_daily_limit_reached():
+                    if not retry_actions:
+                        logger.warning(f"{self.plugin_name}已达当日释放上限，跳过执行")
+                        self._append_run_history(
+                            run_time=run_time,
+                            usage=None,
+                            actions=[],
+                            freed_bytes=0,
+                            status="skipped",
+                            reason="已达当日释放上限",
+                        )
+                        return
+                    logger.warning(f"{self.plugin_name}已达当日释放上限，仅执行失败补偿")
+                    skip_normal_cleanup = True
+
+                usage = self._collect_monitor_usage()
+                self.save_data("latest_usage", usage)
+                self._log_usage_snapshot(usage=usage, stage="本轮空间检查")
+
+                round_actions: List[dict] = []
+                if not skip_normal_cleanup:
+                    round_actions = self._execute_trigger_flow(usage=usage)
+
+                all_actions = retry_actions + round_actions
+                if not all_actions:
+                    logger.info(f"{self.plugin_name}本次无需清理")
+                    self._append_run_history(
+                        run_time=run_time,
+                        usage=usage,
+                        actions=[],
+                        freed_bytes=0,
+                        status="idle",
+                        reason="本次无需清理",
+                    )
+                    self.save_data("last_run_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    return
+
+                history = self.get_data("history") or []
+                history.extend(all_actions)
+                self.save_data("history", self._sanitize_for_json(history[-200:]))
+
+                freed_bytes = sum(int(item.get("freed_bytes", 0) or 0) for item in all_actions)
+                if not self._dry_run and freed_bytes > 0:
+                    self._update_daily_freed_bytes(freed_bytes)
+
+                if self._refresh_mediaserver:
+                    refresh_items = self._collect_refresh_items(all_actions)
+                    refresh_items = self._filter_refresh_items_by_library_scope(refresh_items)
+                    refreshed = self._refresh_media_servers(refresh_items=refresh_items)
+                    if refreshed > 0:
+                        logger.info(f"{self.plugin_name}已触发 {refreshed} 个媒体服务器刷新")
+
+                if self._notify:
+                    text = "\n".join(
+                        [f"{item.get('time')} | {item.get('trigger')} | {item.get('action')}" for item in all_actions[:20]]
+                    )
+                    mode_text = "演练模式" if self._dry_run else "实际删除"
+                    self.post_message(
+                        mtype=NotificationType.Plugin,
+                        title=f"【磁盘清理】任务完成（{mode_text}）",
+                        text=f"{text}\n预计/实际释放：{self._format_size(freed_bytes)}",
+                    )
+
+                self._append_run_history(
+                    run_time=run_time,
+                    usage=usage,
+                    actions=all_actions,
+                    freed_bytes=freed_bytes,
+                    status="completed",
+                    reason="执行完成",
+                )
+                self._log_action_details(actions=all_actions, usage=usage)
+                self._log_dir_cleanup_summary()
+                self.save_data("last_run_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                logger.info(
+                    f"{self.plugin_name}执行完成，本次处理 {len(all_actions)} 条，"
+                    f"{'预计' if self._dry_run else '实际'}释放 {self._format_size(freed_bytes)}"
+                )
+            except Exception as err:
+                try:
+                    self._append_run_history(
+                        run_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        usage=None,
+                        actions=[],
+                        freed_bytes=0,
+                        status="failed",
+                        reason=f"任务异常：{err}",
+                    )
+                except Exception:
+                    pass
+                logger.error(f"{self.plugin_name}任务执行异常：{err}", exc_info=True)
+
+    def _execute_trigger_flow(self, usage: dict) -> List[dict]:
+        flow = self._trigger_flow or "flow_library_mp_downloader"
+        logger.info(f"{self.plugin_name}当前触发流程：{self._trigger_flow_label(flow)}")
+        if flow == "flow_downloader_mp_library":
+            return self._clean_by_download_threshold(usage=usage)
+        if flow == "flow_transfer_oldest":
+            return self._clean_by_transfer_history_oldest(usage=usage)
+        return self._clean_by_library_threshold(usage=usage)
+
+    def _usage_summary_text(self, usage: dict, mode: str, value: float) -> str:
+        usage = usage or {}
+        used_percent = float(usage.get("used_percent", 0) or 0)
+        used_percent = max(0.0, min(100.0, used_percent))
+        free_gib = float(usage.get("free", 0) or 0) / (1024 ** 3)
+        return (
+            f"总 {usage.get('total_text', '0 B')} | 可用 {usage.get('free_text', '0 B')} | "
+            f"(≈{free_gib:.2f} GiB) | 已用 {usage.get('used_text', '0 B')} ({used_percent:.1f}%) | "
+            f"阈值 {self._threshold_text(mode, value)} | 路径 {len(usage.get('paths') or [])}"
+        )
+
+    def _log_usage_snapshot(self, usage: dict, stage: str):
+        download_usage = (usage or {}).get("download", {})
+        library_usage = (usage or {}).get("library", {})
+        if self._monitor_download:
+            download_hit = self._is_threshold_hit(
+                download_usage,
+                self._download_threshold_mode,
+                self._download_threshold_value,
+            )
+            logger.info(
+                f"{self.plugin_name}{stage} 资源目录："
+                f"{self._usage_summary_text(download_usage, self._download_threshold_mode, self._download_threshold_value)} | "
+                f"状态 {'命中阈值' if download_hit else '正常'}"
+            )
+        else:
+            logger.info(f"{self.plugin_name}{stage} 资源目录监听未启用")
+
+        if self._monitor_library:
+            library_hit = self._is_threshold_hit(
+                library_usage,
+                self._library_threshold_mode,
+                self._library_threshold_value,
+            )
+            logger.info(
+                f"{self.plugin_name}{stage} 媒体库目录："
+                f"{self._usage_summary_text(library_usage, self._library_threshold_mode, self._library_threshold_value)} | "
+                f"状态 {'命中阈值' if library_hit else '正常'}"
+            )
+        else:
+            logger.info(f"{self.plugin_name}{stage} 媒体库监听未启用")
+
+    def _log_cleanup_plan(
+        self,
+        trigger: str,
+        target: str,
+        planned_media: int,
+        planned_scrape: int,
+        planned_downloader: int,
+        planned_transfer: int,
+        planned_download: int,
+        freed_bytes: int,
+    ):
+        total_planned = (
+            int(planned_media or 0)
+            + int(planned_scrape or 0)
+            + int(planned_downloader or 0)
+            + int(planned_transfer or 0)
+            + int(planned_download or 0)
+        )
+        if total_planned <= 0 and int(freed_bytes or 0) <= 0:
+            return
+        logger.info(
+            f"{self.plugin_name}开始执行清理计划：触发={trigger} 目标={target} "
+            f"模式={'演练' if self._dry_run else '执行'} | "
+            f"计划 媒体{planned_media} 刮削{planned_scrape} 删种{planned_downloader} "
+            f"整理记录{planned_transfer} 下载记录{planned_download} | "
+            f"预计释放 {self._format_size(int(freed_bytes or 0))}"
+        )
+
+    @staticmethod
+    def _paths_preview_text(paths: List[Any], limit: int = 6) -> str:
+        values = [str(item).strip() for item in (paths or []) if str(item).strip()]
+        if not values:
+            return "-"
+        preview = values[: max(1, int(limit or 1))]
+        text = " ; ".join(preview)
+        if len(values) > len(preview):
+            text = f"{text} ; ...(+{len(values) - len(preview)})"
+        return text
+
+    def _clean_by_library_threshold(self, usage: Optional[dict] = None) -> List[dict]:
+        usage = usage or self._collect_monitor_usage()
+        if not self._monitor_library:
+            logger.info(f"{self.plugin_name}流程1未启用媒体库监听，跳过")
+            return []
+        if not self._is_threshold_hit(usage.get("library", {}), self._library_threshold_mode, self._library_threshold_value):
+            logger.info(
+                f"{self.plugin_name}流程1未命中媒体库阈值，跳过。"
+                f"{self._usage_summary_text(usage.get('library', {}), self._library_threshold_mode, self._library_threshold_value)}"
+            )
+            return []
+        library_scan_paths = (usage.get("library", {}) or {}).get("paths") or [item.as_posix() for item in self._library_paths()]
+        logger.info(
+            f"{self.plugin_name}流程1媒体候选扫描目录({len(library_scan_paths)}): "
+            f"{self._paths_preview_text(library_scan_paths)}"
+        )
+
+        actions: List[dict] = []
+        skipped_paths = set()
+        while not self._is_run_limit_reached(actions):
+            current_usage = self._collect_monitor_usage().get("library", {})
+            if not self._is_threshold_hit(current_usage, self._library_threshold_mode, self._library_threshold_value):
+                break
+
+            candidate = self._pick_oldest_library_media(skipped_paths=skipped_paths)
+            if not candidate:
+                logger.warning(
+                    f"{self.plugin_name}流程1未找到可清理的媒体文件；"
+                    f"{self._last_library_scan_summary or '无扫描摘要'}"
+                )
+                break
+
+            result = self._cleanup_by_media_file(
+                candidate=candidate,
+                trigger="流程1:媒体目录→优先联动MP整理与下载器",
+                require_torrent_link=False,
+            )
+            skipped_paths.add(candidate.get("path").as_posix())
+            if result:
+                actions.append(result)
+                self._current_run_freed_bytes += int(result.get("freed_bytes", 0) or 0)
+        return actions
+
+    def _clean_by_download_threshold(self, usage: Optional[dict] = None) -> List[dict]:
+        usage = usage or self._collect_monitor_usage()
+        download_hit = self._monitor_download and self._is_threshold_hit(
+            usage.get("download", {}),
+            self._download_threshold_mode,
+            self._download_threshold_value,
+        )
+        if not download_hit and not self._monitor_downloader:
+            logger.info(
+                f"{self.plugin_name}流程2未命中下载器触发条件，跳过。"
+                f"{self._usage_summary_text(usage.get('download', {}), self._download_threshold_mode, self._download_threshold_value)}"
+            )
+            return []
+
+        overview_min_days = self._seeding_days if self._monitor_downloader else None
+        self._log_downloader_overview_stats(min_days=overview_min_days, skipped_hashes=set())
+
+        actions: List[dict] = []
+        skipped_hashes = set()
+        while not self._is_run_limit_reached(actions):
+            current_usage = self._collect_monitor_usage()
+            download_hit = self._monitor_download and self._is_threshold_hit(
+                current_usage.get("download", {}),
+                self._download_threshold_mode,
+                self._download_threshold_value,
+            )
+            min_days = self._seeding_days if self._monitor_downloader else None
+            candidate = self._pick_longest_seeding_torrent(min_days=min_days, skipped_hashes=skipped_hashes)
+            if not candidate and download_hit and min_days is not None:
+                # 磁盘阈值已触发时，允许放宽做种时长限制。
+                candidate = self._pick_longest_seeding_torrent(min_days=None, skipped_hashes=skipped_hashes)
+            if not candidate:
+                break
+
+            trigger_text = "流程2:下载器→MP整理→媒体数据(目录阈值)" if download_hit else "流程2:下载器→MP整理→媒体数据(做种阈值)"
+            allow_non_mp_hardlink = self._force_hardlink_cleanup and self._clean_media_data
+            result = self._cleanup_by_torrent(
+                candidate=candidate,
+                trigger=trigger_text,
+                require_mp_history=not allow_non_mp_hardlink,
+            )
+            skipped_hashes.add(candidate.get("hash"))
+            if result:
+                actions.append(result)
+                self._current_run_freed_bytes += int(result.get("freed_bytes", 0) or 0)
+
+        return actions
+
+    def _clean_by_transfer_history_oldest(self, usage: Optional[dict] = None) -> List[dict]:
+        usage = usage or self._collect_monitor_usage()
+        reasons = self._flow3_trigger_reasons(usage)
+        if not reasons:
+            logger.info(
+                f"{self.plugin_name}流程3未命中触发条件，跳过。"
+                f"资源目录：{self._usage_summary_text(usage.get('download', {}), self._download_threshold_mode, self._download_threshold_value)}；"
+                f"媒体库目录：{self._usage_summary_text(usage.get('library', {}), self._library_threshold_mode, self._library_threshold_value)}"
+            )
+            return []
+
+        actions: List[dict] = []
+        skipped_ids = set()
+        while not self._is_run_limit_reached(actions):
+            current_usage = self._collect_monitor_usage()
+            if not self._flow3_trigger_reasons(current_usage):
+                break
+
+            history = self._pick_oldest_transfer_history(skipped_ids=skipped_ids)
+            if not history:
+                logger.warning(f"{self.plugin_name}流程3未找到可清理的整理记录")
+                break
+
+            hid = int(getattr(history, "id", 0) or 0)
+            if hid > 0:
+                skipped_ids.add(hid)
+
+            result = self._cleanup_by_transfer_history(
+                history=history,
+                trigger="流程3:MP整理记录(旧到新)→媒体与下载器",
+            )
+            if result:
+                actions.append(result)
+                self._current_run_freed_bytes += int(result.get("freed_bytes", 0) or 0)
+
+        return actions
+
+    def _flow3_trigger_reasons(self, usage: dict) -> List[str]:
+        reasons: List[str] = []
+        if self._monitor_library and self._is_threshold_hit(
+            usage.get("library", {}),
+            self._library_threshold_mode,
+            self._library_threshold_value,
+        ):
+            reasons.append("媒体库目录阈值")
+        if self._monitor_download and self._is_threshold_hit(
+            usage.get("download", {}),
+            self._download_threshold_mode,
+            self._download_threshold_value,
+        ):
+            reasons.append("资源目录阈值")
+        if self._monitor_downloader:
+            candidate = self._pick_longest_seeding_torrent(min_days=self._seeding_days, skipped_hashes=set())
+            if candidate:
+                reasons.append("下载器做种时长阈值")
+        return reasons
+
+    @staticmethod
+    def _is_cleanup_scope_enabled() -> bool:
+        # 2026-02: 清理与空间监控统一改为“全本地媒体库目录”，不再按媒体库选择做路径过滤。
+        return False
+
+    def _pick_oldest_transfer_history(self, skipped_ids: set) -> Optional[TransferHistorySnapshot]:
+        records = list(self._iter_successful_transfer_history())
+        if not records:
+            logger.info(f"{self.plugin_name}流程3整理记录统计：总0 符合条件0")
+            return None
+
+        def _sort_key(item: TransferHistorySnapshot) -> Tuple[int, int]:
+            date_ts = self._parse_datetime_to_ts(getattr(item, "date", None)) or int(time.time())
+            item_id = int(getattr(item, "id", 0) or 0)
+            return date_ts, item_id
+
+        candidates: List[TransferHistorySnapshot] = []
+        skipped_mark = 0
+        skipped_recent = 0
+        skipped_tv_unended = 0
+        skipped_no_target = 0
+        skipped_block_keyword = 0
+        for history in sorted(records, key=_sort_key):
+            hid = int(getattr(history, "id", 0) or 0)
+            if hid > 0 and hid in skipped_ids:
+                skipped_mark += 1
+                continue
+            if self._is_history_recent(history):
+                skipped_recent += 1
+                continue
+            if not self._is_tv_cleanup_allowed(history):
+                skipped_tv_unended += 1
+                continue
+            if self._path_contains_block_keyword(getattr(history, "dest", None)):
+                skipped_block_keyword += 1
+                continue
+            if not getattr(history, "dest", None) and not getattr(history, "download_hash", None):
+                skipped_no_target += 1
+                continue
+            candidates.append(history)
+        logger.info(
+            f"{self.plugin_name}流程3整理记录统计：总{len(records)} 符合条件{len(candidates)} | "
+            f"近期保护{skipped_recent} 未完结{skipped_tv_unended} "
+            f"关键词过滤{skipped_block_keyword} 无目标{skipped_no_target} 已跳过{skipped_mark}"
+        )
+        if not candidates:
+            return None
+        preferred = [item for item in candidates if self._history_media_type_key(item) == self._media_cleanup_priority]
+        return preferred[0] if preferred else candidates[0]
+
+    @staticmethod
+    def _iter_successful_transfer_history() -> Iterator[TransferHistorySnapshot]:
+        """通过 V3 查询门面逐页读取成功记录，由宿主管理数据库会话。"""
+        page_number = 1
+        while True:
+            result = list_transfer_history(
+                filters={"status": True},
+                page={
+                    "page": page_number,
+                    "count": 200,
+                    "sort": {"field": "date", "direction": "asc"},
+                },
+            )
+            yield from result.items
+            if not result.has_next:
+                break
+            page_number += 1
+
+    def _has_recent_history_in_targets(
+        self,
+        targets: List[Optional[Path]],
+        download_hash: Optional[str] = None,
+    ) -> bool:
+        """目录级删除前检查其中其他记录，避免绕过近期保护。"""
+        if self._protect_recent_days <= 0:
+            return False
+        candidate_targets = [path for path in targets if path]
+        if not candidate_targets and not download_hash:
+            return False
+        for history in self._iter_successful_transfer_history():
+            if not self._is_history_recent(history):
+                continue
+            if download_hash and history.download_hash == download_hash:
+                logger.info(f"{self.plugin_name}关联种子存在近期整理记录，跳过整条清理计划")
+                return True
+            recent_path = self._resolve_local_media_path(history.dest)
+            if recent_path and any(
+                recent_path == target or recent_path.is_relative_to(target)
+                for target in candidate_targets
+            ):
+                logger.info(f"{self.plugin_name}删除目标包含近期整理记录，跳过整条清理计划")
+                return True
+        return False
+
+    def _trigger_flow_label(self, flow: Optional[str] = None) -> str:
+        mapping = {
+            "flow_library_mp_downloader": "1. 媒体优先（推荐）-> 优先联动MP整理/下载器（缺失时仅删本地）",
+            "flow_downloader_mp_library": "2. 下载器优先 -> MP整理记录 -> 媒体数据",
+            "flow_transfer_oldest": "3. 整理记录优先（旧到新）-> 媒体数据 + 下载器做种",
+        }
+        return mapping.get(flow or self._trigger_flow, mapping["flow_library_mp_downloader"])
+
+    def _cleanup_by_transfer_history(self, history: TransferHistorySnapshot, trigger: str) -> Optional[dict]:
+        if not history:
+            return None
+        if self._is_history_recent(history):
+            logger.info(f"{self.plugin_name}命中近期保护，跳过整理记录：{getattr(history, 'dest', '-')}")
+            return None
+        if not self._is_tv_cleanup_allowed(history):
+            logger.info(f"{self.plugin_name}命中“仅清理已完结电视剧”限制，跳过：{getattr(history, 'dest', '-')}")
+            return None
+
+        dest = getattr(history, "dest", None)
+        media_path = self._resolve_local_media_path(dest)
+        download_hash = getattr(history, "download_hash", None)
+        downloader = getattr(history, "downloader", None)
+        library_paths = self._library_paths()
+        delete_roots = self._media_delete_roots(library_paths)
+        cleanup_target = self._resolve_media_cleanup_target(
+            media_path=media_path,
+            history=history,
+            roots=delete_roots,
+        )
+        target_text = cleanup_target.as_posix() if cleanup_target else (str(dest) if dest else "-")
+        if self._should_skip_by_block_keywords(
+            paths=[cleanup_target, media_path, dest],
+            context="流程3-整理记录清理",
+        ):
+            return None
+        download_hash, downloader = self._resolve_download_context_fallback(
+            download_hash=download_hash,
+            downloader=downloader,
+            lookup_paths=[cleanup_target, media_path],
+            context=target_text,
+        )
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{dest or '-'}")
+        scope_enabled = self._is_cleanup_scope_enabled()
+        if scope_enabled:
+            if not media_path or not self._is_path_in_roots(media_path, library_paths):
+                logger.info(f"{self.plugin_name}整理记录不在所选媒体库范围内，跳过：{dest or '-'}")
+                return None
+
+        sidecars = (
+            self._collect_scrape_files(cleanup_target)
+            if cleanup_target and self._clean_scrape_data
+            else []
+        )
+        media_targets: List[Path] = []
+        if self._clean_media_data and cleanup_target and cleanup_target.exists():
+            media_targets.append(cleanup_target)
+        media_targets = self._expand_media_targets_with_hardlinks(
+            media_targets=media_targets,
+            roots=delete_roots,
+            context=target_text,
+            enabled=self._force_hardlink_cleanup and self._clean_media_data,
+        )
+        if self._has_recent_history_in_targets(
+            targets=[cleanup_target, *media_targets, *sidecars],
+            download_hash=download_hash,
+        ):
+            return None
+
+        planned_media = len(media_targets)
+        planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
+        can_delete_seed = self._can_delete_torrent_in_media_flow(
+            downloader=downloader,
+            torrent_hash=download_hash,
+            target=target_text,
+        )
+        planned_downloader = 1 if can_delete_seed else 0
+        planned_transfer = (
+            1 if (self._clean_transfer_history and scope_enabled) else
+            (self._count_transfer_records(download_hash, history) if self._clean_transfer_history else 0)
+        )
+        planned_download = self._count_download_records(download_hash) if self._clean_download_history and download_hash else 0
+
+        freed_bytes = 0
+        for target in media_targets:
+            freed_bytes += self._path_size(target)
+        for sidecar in sidecars:
+            freed_bytes += self._path_size(sidecar)
+
+        if freed_bytes <= 0 and (planned_downloader + planned_transfer + planned_download) <= 0:
+            return None
+
+        self._log_cleanup_plan(
+            trigger=trigger,
+            target=target_text,
+            planned_media=planned_media,
+            planned_scrape=planned_scrape,
+            planned_downloader=planned_downloader,
+            planned_transfer=planned_transfer,
+            planned_download=planned_download,
+            freed_bytes=freed_bytes,
+        )
+
+        if not self._dry_run and self._is_run_bytes_limit_reached(freed_bytes):
+            logger.info(f"{self.plugin_name}单轮容量上限已达，跳过整理记录：{dest or '-'}")
+            return None
+        if not self._dry_run and self._is_daily_bytes_limit_reached(freed_bytes):
+            logger.info(f"{self.plugin_name}当日容量上限将超额，跳过整理记录：{dest or '-'}")
+            return None
+
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        if self._dry_run:
+            removed_media = planned_media
+            removed_scrape = planned_scrape
+            removed_downloader = planned_downloader
+            removed_transfer = planned_transfer
+            removed_download = planned_download
+        else:
+            for target in media_targets:
+                if self._delete_local_item(target, delete_roots):
+                    removed_media += 1
+
+            if self._clean_scrape_data:
+                for sidecar in sidecars:
+                    if self._delete_local_item(sidecar, delete_roots):
+                        removed_scrape += 1
+
+            if can_delete_seed and download_hash and downloader:
+                if self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+                    removed_downloader += 1
+
+            if self._clean_transfer_history:
+                removed_transfer = self._delete_transfer_history(
+                    download_hash=None if scope_enabled else download_hash,
+                    history=history,
+                )
+
+            if self._clean_download_history and download_hash:
+                removed_download = self._delete_download_history(download_hash)
+
+        step_result = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        failed_steps = self._collect_failed_steps(step_result)
+        if failed_steps and not self._dry_run and self._enable_retry_queue:
+            self._enqueue_retry({
+                "mode": "media",
+                "retry_key": f"transfer:{getattr(history, 'id', 0)}",
+                "trigger": trigger,
+                "target": dest or "-",
+                "media_path": dest,
+                "media_targets": [item.as_posix() for item in media_targets],
+                "sidecars": [item.as_posix() for item in sidecars],
+                "download_hash": download_hash,
+                "downloader": downloader,
+                "history_dest": dest,
+                "failed_steps": failed_steps,
+            })
+
+        total_actions = removed_media + removed_scrape + removed_downloader + removed_transfer + removed_download
+        if total_actions <= 0:
+            return None
+
+        action_text = (
+            f"媒体{removed_media} 刮削{removed_scrape} 删种{removed_downloader} "
+            f"整理记录{removed_transfer} 下载记录{removed_download}"
+        )
+        logger.info(f"{self.plugin_name}按整理记录清理：{dest or '-'} -> {action_text}")
+        refresh_items = []
+        refresh_item = self._build_refresh_item(history=history, target_path=dest)
+        if refresh_item:
+            refresh_items.append(refresh_item)
+
+        return {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": trigger,
+            "target": dest or "-",
+            "action": action_text,
+            "freed_bytes": freed_bytes,
+            "mode": "dry-run" if self._dry_run else "apply",
+            "refresh_items": refresh_items,
+            "steps": step_result,
+        }
+
+    def _cleanup_by_media_file(
+        self,
+        candidate: dict,
+        trigger: str = "媒体库阈值",
+        require_torrent_link: bool = False,
+    ) -> Optional[dict]:
+        media_path: Path = candidate.get("path")
+        if not media_path:
+            return None
+
+        history = self._find_transfer_history_by_media_path(media_path)
+        scope_enabled = self._is_cleanup_scope_enabled()
+        if history and self._is_history_recent(history):
+            logger.info(f"{self.plugin_name}命中近期保护，跳过：{media_path.as_posix()}")
+            return None
+        if history and not self._is_tv_cleanup_allowed(history):
+            logger.info(f"{self.plugin_name}命中“仅清理已完结电视剧”限制，跳过：{media_path.as_posix()}")
+            return None
+        download_hash = getattr(history, "download_hash", None) if history else None
+        downloader = getattr(history, "downloader", None) if history else None
+
+        library_paths = self._library_paths()
+        delete_roots = self._media_delete_roots(library_paths)
+        cleanup_target = self._resolve_media_cleanup_target(
+            media_path=media_path,
+            history=history,
+            roots=delete_roots,
+        )
+        if self._should_skip_by_block_keywords(
+            paths=[cleanup_target, media_path],
+            context="流程1-媒体候选清理",
+        ):
+            return None
+        download_hash, downloader = self._resolve_download_context_fallback(
+            download_hash=download_hash,
+            downloader=downloader,
+            lookup_paths=[cleanup_target, media_path],
+            context=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
+        )
+        if self._clean_transfer_history and not history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过整理记录删除：{media_path.as_posix()}")
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{media_path.as_posix()}")
+        if require_torrent_link and not (history and download_hash and downloader):
+            logger.info(f"{self.plugin_name}流程要求MP与下载器均可关联，跳过：{media_path.as_posix()}")
+            return None
+
+        sidecars = (
+            self._collect_scrape_files(cleanup_target)
+            if cleanup_target and self._clean_scrape_data
+            else []
+        )
+        media_targets: List[Path] = []
+        if self._clean_media_data and cleanup_target and cleanup_target.exists():
+            media_targets.append(cleanup_target)
+        # 强制策略：开启后按硬链接关系扩展清理同 inode 文件（含下载目录与媒体库硬链接）。
+        if self._force_hardlink_cleanup and self._clean_media_data and cleanup_target:
+            media_targets = self._expand_media_targets_with_hardlinks(
+                media_targets=media_targets,
+                roots=delete_roots,
+                context=cleanup_target.as_posix(),
+                enabled=True,
+            )
+        else:
+            media_targets = self._expand_media_targets_with_hardlinks(
+                media_targets=media_targets,
+                roots=delete_roots,
+                context=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
+                enabled=False,
+            )
+        if self._has_recent_history_in_targets(
+            targets=[cleanup_target, *media_targets, *sidecars],
+            download_hash=download_hash,
+        ):
+            return None
+
+        planned_media = len(media_targets)
+        planned_scrape = len([item for item in sidecars if item.exists()]) if self._clean_scrape_data else 0
+        planned_downloader = 1 if self._clean_downloader_seed and download_hash and downloader else 0
+        planned_transfer = (
+            1 if (self._clean_transfer_history and scope_enabled and history) else
+            (self._count_transfer_records(download_hash, history) if self._clean_transfer_history else 0)
+        )
+        planned_download = self._count_download_records(download_hash) if self._clean_download_history and download_hash else 0
+
+        freed_bytes = 0
+        for target in media_targets:
+            freed_bytes += self._path_size(target)
+        for sidecar in sidecars:
+            freed_bytes += self._path_size(sidecar)
+
+        if freed_bytes <= 0 and (planned_downloader + planned_transfer + planned_download) <= 0:
+            return None
+
+        self._log_cleanup_plan(
+            trigger=trigger,
+            target=cleanup_target.as_posix() if cleanup_target else media_path.as_posix(),
+            planned_media=planned_media,
+            planned_scrape=planned_scrape,
+            planned_downloader=planned_downloader,
+            planned_transfer=planned_transfer,
+            planned_download=planned_download,
+            freed_bytes=freed_bytes,
+        )
+
+        if not self._dry_run and self._is_run_bytes_limit_reached(freed_bytes):
+            logger.info(f"{self.plugin_name}单轮容量上限已达，跳过：{media_path.as_posix()}")
+            return None
+        if not self._dry_run and self._is_daily_bytes_limit_reached(freed_bytes):
+            logger.info(f"{self.plugin_name}当日容量上限将超额，跳过：{media_path.as_posix()}")
+            return None
+
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        if self._dry_run:
+            removed_media = planned_media
+            removed_scrape = planned_scrape
+            removed_downloader = planned_downloader
+            removed_transfer = planned_transfer
+            removed_download = planned_download
+        else:
+            for target in media_targets:
+                if self._delete_local_item(target, delete_roots):
+                    removed_media += 1
+
+            if self._clean_scrape_data:
+                for sidecar in sidecars:
+                    if self._delete_local_item(sidecar, delete_roots):
+                        removed_scrape += 1
+
+            if self._clean_downloader_seed and download_hash and downloader:
+                if self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+                    removed_downloader += 1
+
+            if self._clean_transfer_history:
+                removed_transfer = self._delete_transfer_history(
+                    download_hash=None if (scope_enabled and history) else download_hash,
+                    history=history,
+                )
+
+            if self._clean_download_history and download_hash:
+                removed_download = self._delete_download_history(download_hash)
+
+        step_result = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        failed_steps = self._collect_failed_steps(step_result)
+        target_path = cleanup_target.as_posix() if cleanup_target else media_path.as_posix()
+        if failed_steps and not self._dry_run and self._enable_retry_queue:
+            self._enqueue_retry({
+                "mode": "media",
+                "retry_key": f"media:{media_path.as_posix()}:{download_hash or ''}",
+                "trigger": trigger,
+                "target": target_path,
+                "media_path": media_path.as_posix(),
+                "media_targets": [item.as_posix() for item in media_targets],
+                "sidecars": [item.as_posix() for item in sidecars],
+                "download_hash": download_hash,
+                "downloader": downloader,
+                "history_dest": getattr(history, "dest", None) if history else None,
+                "failed_steps": failed_steps,
+            })
+
+        total_actions = removed_media + removed_scrape + removed_downloader + removed_transfer + removed_download
+        if total_actions <= 0:
+            return None
+
+        action_text = (
+            f"媒体{removed_media} 刮削{removed_scrape} 删种{removed_downloader} "
+            f"整理记录{removed_transfer} 下载记录{removed_download}"
+        )
+        logger.info(f"{self.plugin_name}按媒体文件清理：{media_path.as_posix()} -> {action_text}")
+        refresh_items = []
+        if history:
+            refresh_item = self._build_refresh_item(history=history, target_path=getattr(history, "dest", media_path))
+            if refresh_item:
+                refresh_items.append(refresh_item)
+
+        return {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": trigger,
+            "target": target_path,
+            "action": action_text,
+            "freed_bytes": freed_bytes,
+            "mode": "dry-run" if self._dry_run else "apply",
+            "refresh_items": refresh_items,
+            "steps": step_result,
+        }
+
+    def _cleanup_by_torrent(
+        self,
+        candidate: dict,
+        trigger: str,
+        require_mp_history: bool = False,
+    ) -> Optional[dict]:
+        download_hash = candidate.get("hash")
+        downloader = candidate.get("downloader")
+        name = candidate.get("name") or download_hash
+
+        if not download_hash:
+            return None
+
+        histories = self._transfer_oper.list_by_hash(download_hash) if self._transfer_oper else []
+        scope_enabled = self._is_cleanup_scope_enabled()
+        library_paths = self._library_paths()
+        delete_roots = self._media_delete_roots(library_paths)
+        download_file_targets = self._download_file_media_paths(download_hash) if self._clean_media_data else []
+        if scope_enabled:
+            scoped_histories = []
+            for history in histories:
+                path = self._resolve_local_media_path(getattr(history, "dest", None))
+                if path and self._is_path_in_roots(path, library_paths):
+                    scoped_histories.append(history)
+            histories = scoped_histories
+            allow_non_mp_hardlink = self._force_hardlink_cleanup and self._clean_media_data
+            if not histories and not allow_non_mp_hardlink:
+                logger.info(f"{self.plugin_name}下载器任务不在所选媒体库范围内，跳过：{downloader}:{name}")
+                return None
+        if require_mp_history and not histories:
+            logger.info(f"{self.plugin_name}跳过非MP关联任务：{downloader}:{name}")
+            return None
+        if self._clean_transfer_history and not histories:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过整理记录删除：{downloader}:{name}")
+        if self._clean_download_history and not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过下载记录删除：{downloader}:{name}")
+        if histories and any(self._is_history_recent(history) for history in histories):
+            logger.info(f"{self.plugin_name}命中近期保护，跳过：{downloader}:{name}")
+            return None
+        if histories and self._tv_complete_only and any(not self._is_tv_cleanup_allowed(history) for history in histories):
+            logger.info(f"{self.plugin_name}命中“仅清理已完结电视剧”限制，跳过：{downloader}:{name}")
+            return None
+
+        media_targets: List[Path] = []
+        sidecar_targets: List[Path] = []
+        if self._clean_media_data or self._clean_scrape_data:
+            handled_paths = set()
+            for history in histories:
+                dest = getattr(history, "dest", None)
+                if not dest:
+                    continue
+                path = self._resolve_local_media_path(dest)
+                path = self._resolve_media_cleanup_target(
+                    media_path=path,
+                    history=history,
+                    roots=delete_roots,
+                )
+                if not path:
+                    continue
+                if path.as_posix() in handled_paths:
+                    continue
+                handled_paths.add(path.as_posix())
+                if self._clean_media_data and path.exists():
+                    media_targets.append(path)
+                if self._clean_scrape_data:
+                    sidecar_targets.extend([item for item in self._collect_scrape_files(path) if item.exists()])
+            for path in download_file_targets:
+                folder_target = self._media_cleanup_dir_from_path(path)
+                if folder_target and not any(folder_target == root for root in delete_roots):
+                    path = folder_target
+                if path.as_posix() in handled_paths:
+                    continue
+                handled_paths.add(path.as_posix())
+                media_targets.append(path)
+
+        media_targets = self._expand_media_targets_with_hardlinks(
+            media_targets=media_targets,
+            roots=delete_roots,
+            context=f"{downloader}:{name}",
+            enabled=self._force_hardlink_cleanup and self._clean_media_data,
+        )
+        history_dests = [getattr(item, "dest", None) for item in histories if getattr(item, "dest", None)]
+        if self._should_skip_by_block_keywords(
+            paths=history_dests + [item.as_posix() for item in media_targets] + [item.as_posix() for item in download_file_targets],
+            context=f"流程2-下载器任务清理({downloader}:{name})",
+        ):
+            return None
+        if scope_enabled and not histories and self._force_hardlink_cleanup and self._clean_media_data:
+            if not any(self._is_path_in_roots(item, library_paths) for item in media_targets):
+                logger.info(f"{self.plugin_name}下载器任务未匹配到媒体库范围，跳过：{downloader}:{name}")
+                return None
+
+        if self._clean_scrape_data and media_targets:
+            for media_target in media_targets:
+                sidecar_targets.extend([item for item in self._collect_scrape_files(media_target) if item.exists()])
+        dedup_sidecars = {}
+        for sidecar in sidecar_targets:
+            dedup_sidecars[sidecar.as_posix()] = sidecar
+        sidecar_targets = list(dedup_sidecars.values())
+        if self._has_recent_history_in_targets(
+            targets=[*media_targets, *sidecar_targets],
+            download_hash=download_hash,
+        ):
+            return None
+
+        planned_media = len(media_targets)
+        planned_scrape = len(sidecar_targets)
+        planned_downloader = 1 if self._clean_downloader_seed and downloader else 0
+        planned_transfer = len(histories) if self._clean_transfer_history else 0
+        planned_download = self._count_download_records(download_hash) if self._clean_download_history else 0
+
+        freed_bytes = sum(self._path_size(path) for path in media_targets) + \
+            sum(self._path_size(path) for path in sidecar_targets)
+
+        if freed_bytes <= 0 and (planned_downloader + planned_transfer + planned_download) <= 0:
+            return None
+
+        self._log_cleanup_plan(
+            trigger=trigger,
+            target=f"{downloader}:{name}",
+            planned_media=planned_media,
+            planned_scrape=planned_scrape,
+            planned_downloader=planned_downloader,
+            planned_transfer=planned_transfer,
+            planned_download=planned_download,
+            freed_bytes=freed_bytes,
+        )
+
+        if not self._dry_run and self._is_run_bytes_limit_reached(freed_bytes):
+            logger.info(f"{self.plugin_name}单轮容量上限已达，跳过：{downloader}:{name}")
+            return None
+        if not self._dry_run and self._is_daily_bytes_limit_reached(freed_bytes):
+            logger.info(f"{self.plugin_name}当日容量上限将超额，跳过：{downloader}:{name}")
+            return None
+
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        if self._dry_run:
+            removed_media = planned_media
+            removed_scrape = planned_scrape
+            removed_downloader = planned_downloader
+            removed_transfer = planned_transfer
+            removed_download = planned_download
+        else:
+            for path in media_targets:
+                if self._delete_local_item(path, delete_roots):
+                    removed_media += 1
+
+            for sidecar in sidecar_targets:
+                if self._delete_local_item(sidecar, delete_roots):
+                    removed_scrape += 1
+
+            if self._clean_downloader_seed and downloader:
+                if self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+                    removed_downloader += 1
+
+            if self._clean_transfer_history:
+                for history in histories:
+                    removed_transfer += self._delete_transfer_history(download_hash=None, history=history)
+
+            if self._clean_download_history:
+                removed_download = self._delete_download_history(download_hash)
+
+        step_result = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        failed_steps = self._collect_failed_steps(step_result)
+        if failed_steps and not self._dry_run and self._enable_retry_queue:
+            self._enqueue_retry({
+                "mode": "torrent",
+                "retry_key": f"torrent:{download_hash}",
+                "trigger": trigger,
+                "target": f"{downloader}:{name}",
+                "download_hash": download_hash,
+                "downloader": downloader,
+                "media_targets": [item.as_posix() for item in media_targets],
+                "sidecar_targets": [item.as_posix() for item in sidecar_targets],
+                "history_dests": [getattr(item, "dest", None) for item in histories if getattr(item, "dest", None)],
+                "failed_steps": failed_steps,
+            })
+
+        total_actions = removed_media + removed_scrape + removed_downloader + removed_transfer + removed_download
+        if total_actions <= 0:
+            return None
+
+        action_text = (
+            f"媒体{removed_media} 刮削{removed_scrape} 删种{removed_downloader} "
+            f"整理记录{removed_transfer} 下载记录{removed_download}"
+        )
+        logger.info(f"{self.plugin_name}按下载器任务清理：{name}({download_hash}) -> {action_text}")
+        refresh_items = []
+        for history in histories:
+            refresh_item = self._build_refresh_item(history=history, target_path=getattr(history, "dest", None))
+            if refresh_item:
+                refresh_items.append(refresh_item)
+
+        return {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": trigger,
+            "target": f"{downloader}:{name}",
+            "action": action_text,
+            "freed_bytes": freed_bytes,
+            "mode": "dry-run" if self._dry_run else "apply",
+            "refresh_items": refresh_items,
+            "steps": step_result,
+        }
+
+    def _pick_oldest_library_media(self, skipped_paths: Optional[set] = None) -> Optional[dict]:
+        library_paths = self._library_paths()
+        if not library_paths:
+            self._last_library_scan_summary = "媒体候选扫描结束：未配置可用媒体库目录"
+            logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
+            return None
+
+        skipped_paths = skipped_paths or set()
+        media_exts = {ext.lower() for ext in settings.RMT_MEDIAEXT}
+        logger.info(
+            f"{self.plugin_name}媒体候选扫描开始：目录({len(library_paths)}) "
+            f"{self._paths_preview_text([item.as_posix() for item in library_paths])} | "
+            f"扩展名({len(media_exts)}) {self._paths_preview_text(sorted(media_exts), limit=10)}"
+        )
+        candidates: List[dict] = []
+        need_history = bool(self._transfer_oper and self._prefer_playback_history)
+        total_roots = len(library_paths)
+        existing_roots = 0
+        scanned_files = 0
+        skipped_non_media = 0
+        matched_media_ext = 0
+        skipped_recent = 0
+        skipped_tv_unended = 0
+        skipped_stat_error = 0
+        skipped_by_mark = 0
+        skipped_block_keyword = 0
+
+        for root in library_paths:
+            if not root.exists():
+                continue
+            existing_roots += 1
+
+            for current_root, _, files in os.walk(root.as_posix()):
+                for filename in files:
+                    scanned_files += 1
+                    path = Path(current_root) / filename
+                    if path.as_posix() in skipped_paths:
+                        skipped_by_mark += 1
+                        continue
+                    if path.suffix.lower() not in media_exts:
+                        skipped_non_media += 1
+                        continue
+                    if self._path_contains_block_keyword(path):
+                        skipped_block_keyword += 1
+                        continue
+                    matched_media_ext += 1
+                    try:
+                        stat = path.stat()
+                    except Exception:
+                        skipped_stat_error += 1
+                        continue
+                    history = self._find_transfer_history_by_media_path(path) if need_history else None
+                    if history and self._is_history_recent(history):
+                        skipped_recent += 1
+                        continue
+                    if history and not self._is_tv_cleanup_allowed(history):
+                        skipped_tv_unended += 1
+                        continue
+                    atime = stat.st_atime or stat.st_mtime
+                    candidates.append({
+                        "path": path,
+                        "atime": atime,
+                        "history": history,
+                        "media_type": self._history_media_type_key(history),
+                    })
+
+        if not candidates:
+            self._last_library_scan_stats = {
+                "roots_total": total_roots,
+                "roots_existing": existing_roots,
+                "files_total": scanned_files,
+                "media_files": matched_media_ext,
+                "eligible": 0,
+                "filtered_recent": skipped_recent,
+                "filtered_tv_unended": skipped_tv_unended,
+                "filtered_marked": skipped_by_mark,
+                "filtered_stat_error": skipped_stat_error,
+                "filtered_non_media": skipped_non_media,
+                "filtered_block_keyword": skipped_block_keyword,
+            }
+            self._last_library_scan_summary = (
+                f"媒体候选扫描结束：未找到可清理媒体文件 | "
+                f"目录 {existing_roots}/{total_roots} | 扫描文件 {scanned_files} | "
+                f"媒体文件 {matched_media_ext} | 非媒体扩展 {skipped_non_media} | 近期保护 {skipped_recent} | "
+                f"未完结电视剧 {skipped_tv_unended} | 关键词过滤 {skipped_block_keyword} | "
+                f"已跳过标记 {skipped_by_mark} | 读取失败 {skipped_stat_error}"
+            )
+            logger.info(
+                f"{self.plugin_name}流程1媒体库任务统计：总文件{scanned_files} 媒体文件{matched_media_ext} "
+                f"符合条件0 | 近期保护{skipped_recent} 未完结{skipped_tv_unended} "
+                f"关键词过滤{skipped_block_keyword} 已跳过{skipped_by_mark}"
+            )
+            logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
+            return None
+
+        preferred = [item for item in candidates if item.get("media_type") == self._media_cleanup_priority]
+        candidate_pool = preferred if preferred else candidates
+        selected = None
+        selected_ts = int(time.time())
+        for candidate in candidate_pool:
+            current_ts = self._effective_access_ts(
+                path=candidate.get("path"),
+                history=candidate.get("history"),
+                fallback_ts=candidate.get("atime"),
+            )
+            if selected is None or current_ts < selected_ts:
+                selected = candidate
+                selected_ts = current_ts
+        if not selected:
+            return None
+
+        selected_path = selected.get("path")
+        self._last_library_scan_stats = {
+            "roots_total": total_roots,
+            "roots_existing": existing_roots,
+            "files_total": scanned_files,
+            "media_files": matched_media_ext,
+            "eligible": len(candidates),
+            "filtered_recent": skipped_recent,
+            "filtered_tv_unended": skipped_tv_unended,
+            "filtered_marked": skipped_by_mark,
+            "filtered_stat_error": skipped_stat_error,
+            "filtered_non_media": skipped_non_media,
+            "filtered_block_keyword": skipped_block_keyword,
+        }
+        self._last_library_scan_summary = (
+            f"媒体候选扫描完成：候选 {len(candidates)} 条 "
+            f"(优先类型候选 {len(preferred)} 条)，选中 {selected_path.as_posix() if selected_path else '-'} | "
+            f"扫描文件 {scanned_files} 媒体文件 {matched_media_ext}"
+        )
+        logger.info(
+            f"{self.plugin_name}流程1媒体库任务统计：总文件{scanned_files} 媒体文件{matched_media_ext} "
+            f"符合条件{len(candidates)} | 近期保护{skipped_recent} 未完结{skipped_tv_unended} "
+            f"关键词过滤{skipped_block_keyword} 已跳过{skipped_by_mark}"
+        )
+        logger.info(f"{self.plugin_name}{self._last_library_scan_summary}")
+
+        return {
+            "path": selected.get("path"),
+            "atime": selected_ts,
+            "raw_atime": selected.get("atime"),
+        }
+
+    @staticmethod
+    def _normalize_media_priority(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"tv", "电视剧", "series"}:
+            return "tv"
+        return "movie"
+
+    @staticmethod
+    def _media_type_key(raw_type: Any) -> str:
+        text = str(raw_type or "").strip().lower()
+        if text in {"电影", "movie", "mov", "film"}:
+            return "movie"
+        if text in {"电视剧", "tv", "series", "show"}:
+            return "tv"
+        return "unknown"
+
+    def _history_media_type_key(self, history: Any) -> str:
+        if not history:
+            return "unknown"
+        return self._media_type_key(getattr(history, "type", None))
+
+    def _is_tv_cleanup_allowed(self, history: Any) -> bool:
+        if not history or not self._tv_complete_only:
+            return True
+        if self._history_media_type_key(history) != "tv":
+            return True
+        try:
+            # V3 的 media_id 只在 TMDB 来源下才是 TMDB ID，其他来源不能混用。
+            source = normalize_media_source(history.media_source)
+            if source != MediaSource.TMDB:
+                return False
+            return self._is_tv_series_ended_by_tmdb(history.media_id)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}检查电视剧完结状态失败：{err}")
+            return False
+
+    def _is_tv_series_ended_by_tmdb(self, tmdbid: Any) -> bool:
+        if not tmdbid:
+            return False
+        try:
+            tmdb_id = int(tmdbid)
+        except Exception:
+            return False
+        cache_key = str(tmdb_id)
+        cached = self._tv_end_state_cache.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+        try:
+            tmdb_info = self.chain.tmdb_info(tmdbid=tmdb_id, mtype=MediaType.TV) if self.chain else None
+            if not isinstance(tmdb_info, dict) or not tmdb_info:
+                self._tv_end_state_cache[cache_key] = False
+                return False
+            status_text = str(tmdb_info.get("status") or "").strip().lower()
+            ended_status = {"ended", "canceled", "cancelled", "已完结", "完结", "已取消", "取消"}
+            is_ended = False
+            if status_text:
+                is_ended = status_text in ended_status
+            elif tmdb_info.get("in_production") is False:
+                is_ended = True
+            self._tv_end_state_cache[cache_key] = bool(is_ended)
+            return bool(is_ended)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}查询TMDB电视剧状态失败 tmdbid={tmdb_id}: {err}")
+            self._tv_end_state_cache[cache_key] = False
+            return False
+
+    def _effective_access_ts(self, path: Optional[Path], history: Any, fallback_ts: Optional[float]) -> int:
+        playback_ts = self._get_history_playback_ts(history)
+        if playback_ts:
+            return int(playback_ts)
+
+        history_ts = self._parse_datetime_to_ts(getattr(history, "date", None)) if history else None
+        if history_ts:
+            return int(history_ts)
+
+        if fallback_ts:
+            return int(fallback_ts)
+
+        try:
+            if path and path.exists():
+                return int(path.stat().st_mtime)
+        except Exception:
+            pass
+        return int(time.time())
+
+    def _get_history_playback_ts(self, history: Any) -> Optional[int]:
+        if not self._prefer_playback_history or not history:
+            return None
+
+        mtype = history.type
+        source = normalize_media_source(history.media_source)
+        media_id = history.media_id
+        if not mtype or not source or not media_id:
+            return None
+
+        season = self._extract_season_number(getattr(history, "seasons", None))
+        cache_key = f"{mtype}:{source.value}:{media_id}:{season if season is not None else ''}"
+        cached_ts = self._playback_ts_cache.get(cache_key)
+        if cached_ts is not None:
+            return cached_ts or None
+
+        try:
+            if not self._mediaserver_oper:
+                self._mediaserver_oper = MediaServerOper()
+            media_item = self._mediaserver_oper.exists(
+                media_source=source,
+                media_id=str(media_id),
+                mtype=mtype,
+                season=season,
+                title=history.title,
+                year=history.year,
+            )
+            if not media_item:
+                self._playback_ts_cache[cache_key] = 0
+                return None
+
+            server = getattr(media_item, "server", None)
+            item_id = getattr(media_item, "item_id", None)
+            if not server or not item_id:
+                self._playback_ts_cache[cache_key] = 0
+                return None
+
+            if not self._mediaserver_chain:
+                self._mediaserver_chain = MediaServerChain()
+            item_info = self._mediaserver_chain.iteminfo(server=server, item_id=item_id)
+            user_state = getattr(item_info, "user_state", None)
+            last_played = getattr(user_state, "last_played_date", None) if user_state else None
+            ts = self._parse_datetime_to_ts(last_played) or 0
+            self._playback_ts_cache[cache_key] = ts
+            return ts or None
+        except Exception as err:
+            logger.debug(f"{self.plugin_name}读取播放历史失败：{err}")
+            self._playback_ts_cache[cache_key] = 0
+            return None
+
+    @staticmethod
+    def _extract_season_number(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        match = re.search(r"(\d+)", str(value))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_datetime_to_ts(date_text: Any) -> Optional[int]:
+        if not date_text:
+            return None
+        if isinstance(date_text, datetime):
+            return int(date_text.timestamp())
+        text = str(date_text).strip()
+        if text.isdecimal() and len(text) == 10:
+            return int(text)
+        try:
+            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            return None
+
+    def _pick_longest_seeding_torrent(self, min_days: Optional[int], skipped_hashes: set) -> Optional[dict]:
+        name_filters = self._downloaders if self._downloaders else None
+        services = self._resolve_downloader_services(name_filters=name_filters)
+        if not services:
+            return None
+
+        best = None
+        min_seconds = int(min_days * 86400) if min_days else 0
+        stats: Dict[str, Dict[str, Any]] = {}
+
+        for downloader_name, service in services.items():
+            stats_item = {
+                "total": 0,
+                "invalid_hash": 0,
+                "skip_hash": 0,
+                "below_min": 0,
+                "eligible": 0,
+                "inactive": False,
+                "error": "",
+            }
+            stats[downloader_name] = stats_item
+            instance = service.instance
+            if not instance:
+                continue
+            if hasattr(instance, "is_inactive") and instance.is_inactive():
+                stats_item["inactive"] = True
+                continue
+
+            try:
+                service_type = str(getattr(service, "type", "") or "").strip().lower()
+                torrents = self._list_completed_torrents_for_cleanup(instance=instance, service_type=service_type)
+            except Exception as err:
+                stats_item["error"] = str(err)
+                logger.warning(f"{self.plugin_name}读取下载器完成任务失败 {downloader_name}：{err}")
+                continue
+            stats_item["total"] = len(torrents)
+            for torrent in torrents:
+                torrent_hash = self._torrent_hash(torrent)
+                if not torrent_hash:
+                    stats_item["invalid_hash"] += 1
+                    continue
+                if torrent_hash in skipped_hashes:
+                    stats_item["skip_hash"] += 1
+                    continue
+
+                seed_seconds = self._torrent_seed_seconds(torrent)
+                if seed_seconds < min_seconds:
+                    stats_item["below_min"] += 1
+                    continue
+
+                stats_item["eligible"] += 1
+                if not best or seed_seconds > best["seed_seconds"]:
+                    best = {
+                        "downloader": downloader_name,
+                        "hash": torrent_hash,
+                        "name": self._torrent_name(torrent),
+                        "seed_seconds": seed_seconds,
+                    }
+
+        if not best:
+            threshold_text = f">= {int(min_days)} 天" if min_days else "不限"
+            detail_parts: List[str] = []
+            for downloader_name in sorted(stats.keys()):
+                item = stats.get(downloader_name) or {}
+                if item.get("error"):
+                    detail_parts.append(f"{downloader_name}:异常={item.get('error')}")
+                    continue
+                if item.get("inactive"):
+                    detail_parts.append(f"{downloader_name}:未激活")
+                    continue
+                detail_parts.append(
+                    f"{downloader_name}:完成{item.get('total', 0)} 可选{item.get('eligible', 0)} "
+                    f"过滤(hash缺失{item.get('invalid_hash', 0)}/已跳过{item.get('skip_hash', 0)}/做种不足{item.get('below_min', 0)})"
+                )
+            logger.info(
+                f"{self.plugin_name}下载器候选扫描无结果：所选下载器"
+                f"{' ; '.join(name_filters) if name_filters else '全部'}，做种阈值 {threshold_text}；"
+                f"{'；'.join(detail_parts) if detail_parts else '无可用统计'}"
+            )
+
+        return best
+
+    def _resolve_downloader_services(self, name_filters: Optional[List[str]]) -> Dict[str, Any]:
+        helper = DownloaderHelper()
+        all_services: Dict[str, Any] = {}
+        try:
+            all_services = helper.get_services() or {}
+            services = helper.get_services(name_filters=name_filters) if name_filters else all_services
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取下载器列表失败：{err}")
+            return {}
+
+        if name_filters and not services and all_services:
+            lower_name_map = {name.lower(): name for name in all_services.keys()}
+            normalized_filters = [lower_name_map.get(str(item).lower()) for item in name_filters]
+            normalized_filters = [item for item in normalized_filters if item]
+            if normalized_filters:
+                normalized_set = set(normalized_filters)
+                services = {
+                    name: service
+                    for name, service in all_services.items()
+                    if name in normalized_set
+                }
+                if services:
+                    logger.info(
+                        f"{self.plugin_name}下载器名称已自动纠正（大小写）："
+                        f"{' ; '.join(name_filters)} -> {' ; '.join(sorted(services.keys()))}"
+                    )
+
+        if name_filters and not services:
+            available = sorted(all_services.keys()) if all_services else []
+            logger.warning(
+                f"{self.plugin_name}所选下载器无可用实例：{' ; '.join(name_filters)}"
+                f"{'；当前可用：' + ' ; '.join(available) if available else '；当前没有可用下载器实例'}"
+            )
+            return {}
+        return services or {}
+
+    @staticmethod
+    def _parse_torrent_list_result(result: Any) -> Optional[List[Any]]:
+        if result is None:
+            return []
+        if isinstance(result, tuple):
+            if not result:
+                return []
+            torrents = result[0] if len(result) >= 1 else []
+            error = bool(result[1]) if len(result) >= 2 else False
+            if error:
+                return None
+            return list(torrents or [])
+        if isinstance(result, list):
+            return result
+        return None
+
+    def _safe_list_torrents(self, instance: Any, status: Any = None) -> Optional[List[Any]]:
+        if not hasattr(instance, "get_torrents"):
+            return None
+        try:
+            if status is None:
+                result = instance.get_torrents()
+            else:
+                result = instance.get_torrents(status=status)
+        except Exception:
+            return None
+        return self._parse_torrent_list_result(result)
+
+    def _list_completed_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
+        # 统一口径：已完成任务应包含“暂停但已完成”的种子。
+        if hasattr(instance, "get_torrents"):
+            result: Any = None
+            if service_type == "qbittorrent":
+                result = instance.get_torrents(status="completed")
+            elif service_type == "transmission":
+                result = instance.get_torrents(status=["seeding", "seed_pending", "stopped"])
+            if result is not None:
+                parsed = self._parse_torrent_list_result(result)
+                if parsed is not None:
+                    return parsed
+
+        if hasattr(instance, "get_completed_torrents"):
+            return list(instance.get_completed_torrents() or [])
+        return []
+
+    def _list_downloading_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
+        if hasattr(instance, "get_downloading_torrents"):
+            try:
+                return list(instance.get_downloading_torrents() or [])
+            except Exception:
+                pass
+        if service_type == "transmission":
+            return self._safe_list_torrents(instance=instance, status=["downloading", "download_pending"]) or []
+        return self._safe_list_torrents(instance=instance, status="downloading") or []
+
+    def _list_paused_torrents_for_cleanup(self, instance: Any, service_type: str) -> List[Any]:
+        if service_type == "transmission":
+            return self._safe_list_torrents(instance=instance, status=["stopped"]) or []
+        return self._safe_list_torrents(instance=instance, status="paused") or []
+
+    def _collect_downloader_overview_stats(self, min_days: Optional[int], skipped_hashes: set) -> Tuple[dict, List[dict]]:
+        services = self._resolve_downloader_services(name_filters=self._downloaders if self._downloaders else None)
+        summary = {"total": 0, "completed": 0, "downloading": 0, "paused": 0, "eligible": 0}
+        details: List[dict] = []
+        if not services:
+            return summary, details
+
+        min_seconds = int(min_days * 86400) if min_days else 0
+        for downloader_name, service in services.items():
+            item = {
+                "name": downloader_name,
+                "total": 0,
+                "completed": 0,
+                "downloading": 0,
+                "paused": 0,
+                "eligible": 0,
+                "inactive": False,
+                "error": "",
+            }
+            details.append(item)
+            instance = getattr(service, "instance", None)
+            if not instance:
+                continue
+            if hasattr(instance, "is_inactive") and instance.is_inactive():
+                item["inactive"] = True
+                continue
+            service_type = str(getattr(service, "type", "") or "").strip().lower()
+            try:
+                total = self._safe_list_torrents(instance=instance) or []
+            except Exception as err:
+                item["error"] = str(err)
+                continue
+
+            item["total"] = len(total)
+            if item["total"] <= 0:
+                completed_fallback = self._list_completed_torrents_for_cleanup(instance=instance, service_type=service_type)
+                downloading_fallback = self._list_downloading_torrents_for_cleanup(instance=instance, service_type=service_type)
+                paused_fallback = self._list_paused_torrents_for_cleanup(instance=instance, service_type=service_type)
+                merged = completed_fallback + downloading_fallback + paused_fallback
+                dedup: Dict[str, Any] = {}
+                for torrent in merged:
+                    torrent_hash = self._torrent_hash(torrent)
+                    if torrent_hash:
+                        dedup[torrent_hash] = torrent
+                total = list(dedup.values()) if dedup else merged
+                item["total"] = len(total)
+
+            completed_candidates: List[Any] = []
+            for torrent in total:
+                if self._is_torrent_completed(torrent):
+                    completed_candidates.append(torrent)
+            item["completed"] = len(completed_candidates)
+            item["downloading"] = len([torrent for torrent in total if self._is_torrent_downloading(torrent)])
+            item["paused"] = len([torrent for torrent in total if self._is_torrent_paused(torrent)])
+
+            eligible = 0
+            for torrent in completed_candidates:
+                torrent_hash = self._torrent_hash(torrent)
+                if not torrent_hash or torrent_hash in skipped_hashes:
+                    continue
+                if self._torrent_seed_seconds(torrent) < min_seconds:
+                    continue
+                eligible += 1
+            item["eligible"] = eligible
+
+            summary["total"] += item["total"]
+            summary["completed"] += item["completed"]
+            summary["downloading"] += item["downloading"]
+            summary["paused"] += item["paused"]
+            summary["eligible"] += item["eligible"]
+        return summary, details
+
+    def _log_downloader_overview_stats(self, min_days: Optional[int], skipped_hashes: set):
+        summary, details = self._collect_downloader_overview_stats(min_days=min_days, skipped_hashes=skipped_hashes)
+        threshold_text = f">= {int(min_days)} 天" if min_days else "不限"
+        if not details:
+            logger.info(f"{self.plugin_name}流程2下载器任务统计：无可用下载器实例")
+            return
+        detail_text_parts: List[str] = []
+        for item in details:
+            if item.get("error"):
+                detail_text_parts.append(f"{item.get('name')}:异常={item.get('error')}")
+                continue
+            if item.get("inactive"):
+                detail_text_parts.append(f"{item.get('name')}:未激活")
+                continue
+            detail_text_parts.append(
+                f"{item.get('name')}(总{item.get('total', 0)} 完成{item.get('completed', 0)} "
+                f"下载中{item.get('downloading', 0)} 暂停{item.get('paused', 0)} 符合{item.get('eligible', 0)})"
+            )
+        logger.info(
+            f"{self.plugin_name}流程2下载器任务统计：总{summary.get('total', 0)} 完成{summary.get('completed', 0)} "
+            f"下载中{summary.get('downloading', 0)} 暂停{summary.get('paused', 0)} "
+            f"符合条件{summary.get('eligible', 0)} | 做种阈值 {threshold_text} | "
+            f"{' ; '.join(detail_text_parts)}"
+        )
+
+    def _collect_monitor_usage(self) -> dict:
+        return {
+            "download": self._calc_usage(self._download_paths()),
+            "library": self._calc_usage(self._library_paths()),
+        }
+
+    def _download_paths(self) -> List[Path]:
+        try:
+            dirs = DirectoryHelper().get_local_download_dirs() or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取下载目录失败：{err}")
+            return []
+        return self._unique_existing_paths(
+            [Path(item.download_path) for item in dirs if getattr(item, "download_path", None)]
+        )
+
+    def _library_paths(self) -> List[Path]:
+        try:
+            dirs = DirectoryHelper().get_local_library_dirs() or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取媒体库目录失败：{err}")
+            return []
+        all_library_paths = self._unique_existing_paths(
+            [Path(item.library_path) for item in dirs if getattr(item, "library_path", None)]
+        )
+        if (self._media_servers or self._media_libraries) and not self._library_scope_filter_notice_logged:
+            logger.info(
+                f"{self.plugin_name}媒体目录空间统计与清理已启用全目录模式，"
+                f"忽略媒体服务器/媒体库路径过滤（该选择仅用于媒体库刷新目标）。"
+            )
+            self._library_scope_filter_notice_logged = True
+        return all_library_paths
+
+    def _media_library_items(self, server_filters: Optional[List[str]] = None) -> List[dict]:
+        services = MediaServerHelper().get_services(
+            name_filters=server_filters if server_filters else None
+        )
+        if not services:
+            return []
+
+        if not self._mediaserver_chain:
+            self._mediaserver_chain = MediaServerChain()
+
+        items: List[dict] = []
+        seen = set()
+        for server_name in services.keys():
+            try:
+                libraries = self._mediaserver_chain.librarys(server=server_name, hidden=True) or []
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}获取媒体库列表失败 {server_name}：{err}")
+                continue
+            for library in libraries:
+                key = f"{server_name}::{getattr(library, 'id', '')}"
+                if key.endswith("::") or key in seen:
+                    continue
+                seen.add(key)
+                name = str(getattr(library, "name", "") or getattr(library, "id", ""))
+                path_desc = self._extract_library_path_list(getattr(library, "path", None))
+                desc = path_desc[0] if path_desc else ""
+                if len(path_desc) > 1:
+                    desc = f"{desc} +{len(path_desc) - 1}"
+                title = f"{server_name} / {name}"
+                if desc:
+                    title = f"{title} ({desc})"
+                items.append({"title": title, "value": key})
+        return sorted(items, key=lambda item: item.get("title", ""))
+
+    def _library_scope_paths(self) -> List[Path]:
+        if not self._media_servers and not self._media_libraries:
+            return []
+        if self._library_scope_cache is not None:
+            return self._library_scope_cache
+
+        selected_servers = [item for item in (self._media_servers or []) if str(item).strip()]
+        selected_keys = []
+        for raw in self._media_libraries or []:
+            server_name, library_id = self._parse_library_key(raw)
+            if not server_name or not library_id:
+                continue
+            selected_keys.append(f"{server_name}::{library_id}")
+            if server_name not in selected_servers:
+                selected_servers.append(server_name)
+
+        if not selected_servers:
+            self._library_scope_cache = []
+            return self._library_scope_cache
+
+        try:
+            services = MediaServerHelper().get_services(name_filters=selected_servers)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}获取媒体库服务失败：{err}")
+            self._library_scope_cache = []
+            return self._library_scope_cache
+        if not services:
+            self._library_scope_cache = []
+            return self._library_scope_cache
+
+        if not self._mediaserver_chain:
+            self._mediaserver_chain = MediaServerChain()
+
+        filter_by_key = set(selected_keys)
+        resolved_paths: List[Path] = []
+        for server_name in services.keys():
+            try:
+                libraries = self._mediaserver_chain.librarys(server=server_name, hidden=True) or []
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}获取媒体库范围失败 {server_name}：{err}")
+                continue
+            for library in libraries:
+                library_key = f"{server_name}::{getattr(library, 'id', '')}"
+                if filter_by_key and library_key not in filter_by_key:
+                    continue
+                for raw_path in self._extract_library_path_list(getattr(library, "path", None)):
+                    mapped = self._resolve_local_media_path(raw_path)
+                    if mapped:
+                        resolved_paths.append(mapped)
+
+        self._library_scope_cache = self._unique_existing_paths(resolved_paths)
+        return self._library_scope_cache
+
+    def _effective_media_servers(self) -> List[str]:
+        servers = [item for item in (self._media_servers or []) if str(item).strip()]
+        for item in self._media_libraries or []:
+            server_name, _ = self._parse_library_key(item)
+            if server_name and server_name not in servers:
+                servers.append(server_name)
+        return servers
+
+    @staticmethod
+    def _filter_paths_by_scope(paths: List[Path], scope_paths: List[Path]) -> List[Path]:
+        filtered = []
+        for path in paths:
+            for scope in scope_paths:
+                try:
+                    if path == scope or path.is_relative_to(scope) or scope.is_relative_to(path):
+                        filtered.append(path)
+                        break
+                except Exception:
+                    continue
+        unique: Dict[str, Path] = {}
+        for item in filtered:
+            unique[item.as_posix()] = item
+        return list(unique.values())
+
+    @staticmethod
+    def _parse_library_key(raw: Any) -> Tuple[str, str]:
+        text = str(raw or "").strip()
+        if "::" not in text:
+            return "", ""
+        server_name, library_id = text.split("::", 1)
+        server_name = str(server_name).strip()
+        library_id = str(library_id).strip()
+        if not server_name or not library_id:
+            return "", ""
+        return server_name, library_id
+
+    @staticmethod
+    def _extract_library_path_list(raw_path: Any) -> List[str]:
+        values = raw_path if isinstance(raw_path, list) else [raw_path]
+        result = []
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                result.append(text)
+        return result
+
+    def _filter_refresh_items_by_library_scope(
+        self, refresh_items: Optional[List[RefreshMediaItem]]
+    ) -> List[RefreshMediaItem]:
+        if not refresh_items:
+            return []
+        return refresh_items
+
+    @staticmethod
+    def _unique_existing_paths(paths: List[Path]) -> List[Path]:
+        unique = {}
+        for path in paths:
+            if not path:
+                continue
+            norm = Path(path).expanduser()
+            unique[norm.as_posix()] = norm
+        return list(unique.values())
+
+    def _calc_usage(self, paths: List[Path]) -> dict:
+        try:
+            total, free = SystemUtils.space_usage(paths)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}统计磁盘空间失败：{err}")
+            total, free = 0, 0
+        used = max(0, total - free)
+        free_percent = (free * 100 / total) if total else 0
+        used_percent = (used * 100 / total) if total else 0
+
+        return {
+            "paths": [path.as_posix() for path in paths],
+            "total": total,
+            "free": free,
+            "used": used,
+            "free_percent": round(free_percent, 2),
+            "used_percent": round(used_percent, 2),
+            "total_text": self._format_size(total),
+            "free_text": self._format_size(free),
+            "used_text": self._format_size(used),
+        }
+
+    @staticmethod
+    def _is_threshold_hit(usage: dict, mode: str, value: float) -> bool:
+        if not usage or not usage.get("total"):
+            return False
+        if mode == "percent":
+            return usage.get("free_percent", 0) <= value
+        free_gb = usage.get("free", 0) / (1024 ** 3)
+        return free_gb <= value
+
+    def _threshold_text(self, mode: str, value: float) -> str:
+        if mode == "percent":
+            return f"剩余 <= {self._format_threshold_value(value, 'percent')}"
+        return f"剩余 <= {self._format_threshold_value(value, 'size')}"
+
+    @staticmethod
+    def _parse_threshold_value(raw_value: Any, mode: str) -> float:
+        default_value = 10.0 if mode == "percent" else 100.0
+        if raw_value is None or raw_value == "":
+            return default_value
+        if isinstance(raw_value, (int, float)):
+            return float(raw_value)
+
+        text = str(raw_value).strip().lower()
+        if not text:
+            return default_value
+
+        factor = 1.0
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        elif text.endswith("gb") or text.endswith("g"):
+            text = text.rstrip("b").rstrip("g").strip()
+        elif text.endswith("tb") or text.endswith("t"):
+            text = text.rstrip("b").rstrip("t").strip()
+            factor = 1024.0
+        elif text.endswith("mb") or text.endswith("m"):
+            text = text.rstrip("b").rstrip("m").strip()
+            factor = 1.0 / 1024.0
+
+        try:
+            value = float(text) * factor
+        except Exception:
+            return default_value
+        return value
+
+    @staticmethod
+    def _format_threshold_value(value: Any, mode: str) -> str:
+        try:
+            val = float(value)
+        except Exception:
+            val = 10.0 if mode == "percent" else 100.0
+        if mode == "percent":
+            if abs(val - int(val)) < 1e-9:
+                return f"{int(val)}%"
+            return f"{val:.1f}%"
+        if abs(val - int(val)) < 1e-9:
+            return f"{int(val)}G"
+        return f"{val:.1f}G"
+
+    def _media_delete_roots(self, library_roots: Optional[List[Path]] = None) -> List[Path]:
+        roots = list(library_roots or self._library_paths())
+        if self._force_hardlink_cleanup:
+            roots.extend(self._download_paths())
+        return self._unique_existing_paths(roots)
+
+    def _collect_hardlink_siblings(self, media_path: Path, roots: List[Path]) -> List[Path]:
+        try:
+            base = Path(media_path)
+            if not base.exists() or not base.is_file() or base.is_symlink():
+                logger.info(f"{self.plugin_name}硬链接扫描跳过：{base.as_posix()}（不存在/非文件/符号链接）")
+                return []
+            base_stat = base.stat()
+            base_links = int(getattr(base_stat, "st_nlink", 1) or 1)
+            if base_links <= 1:
+                logger.info(f"{self.plugin_name}硬链接扫描跳过：{base.as_posix()}（nlink={base_links}）")
+                return []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}硬链接扫描失败，无法读取目标文件：{media_path} err={err}")
+            return []
+
+        active_roots: List[Path] = []
+        for root in roots or []:
+            try:
+                if root.exists():
+                    active_roots.append(root)
+            except Exception:
+                continue
+        if not active_roots:
+            logger.info(f"{self.plugin_name}硬链接扫描跳过：{base.as_posix()}（无可扫描根目录）")
+            return []
+
+        logger.info(
+            f"{self.plugin_name}硬链接扫描开始：目标={base.as_posix()} "
+            f"nlink={base_links} 根目录={len(active_roots)}"
+        )
+        siblings: Dict[str, Path] = {}
+        scanned_files = 0
+        for root in active_roots:
+            for current_root, _, files in os.walk(root.as_posix()):
+                for filename in files:
+                    path = Path(current_root) / filename
+                    if path == base:
+                        continue
+                    try:
+                        if path.is_symlink() or not path.is_file():
+                            continue
+                        stat = path.stat()
+                    except Exception:
+                        continue
+                    scanned_files += 1
+                    if stat.st_ino == base_stat.st_ino and stat.st_dev == base_stat.st_dev:
+                        siblings[path.as_posix()] = path
+        logger.info(
+            f"{self.plugin_name}硬链接扫描完成：目标={base.as_posix()} "
+            f"扫描文件={scanned_files} 命中关联文件={len(siblings)}"
+        )
+        return list(siblings.values())
+
+    def _collect_hardlink_siblings_in_directory(self, media_dir: Path, roots: List[Path]) -> List[Path]:
+        try:
+            base_dir = Path(media_dir)
+            if not base_dir.exists() or not base_dir.is_dir() or base_dir.is_symlink():
+                logger.info(f"{self.plugin_name}目录硬链接扫描跳过：{base_dir.as_posix()}（不存在/非目录/符号链接）")
+                return []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}目录硬链接扫描失败，无法读取目录：{media_dir} err={err}")
+            return []
+
+        inode_keys = set()
+        scanned_sources = 0
+        for current_root, _, files in os.walk(base_dir.as_posix()):
+            for filename in files:
+                path = Path(current_root) / filename
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    stat = path.stat()
+                except Exception:
+                    continue
+                scanned_sources += 1
+                if int(getattr(stat, "st_nlink", 1) or 1) <= 1:
+                    continue
+                inode_keys.add((int(stat.st_dev), int(stat.st_ino)))
+
+        if not inode_keys:
+            logger.info(
+                f"{self.plugin_name}目录硬链接扫描跳过：{base_dir.as_posix()} "
+                f"（目录文件={scanned_sources}，无可扩展硬链接）"
+            )
+            return []
+
+        active_roots: List[Path] = []
+        for root in roots or []:
+            try:
+                if root.exists():
+                    active_roots.append(root)
+            except Exception:
+                continue
+        if not active_roots:
+            logger.info(f"{self.plugin_name}目录硬链接扫描跳过：{base_dir.as_posix()}（无可扫描根目录）")
+            return []
+
+        logger.info(
+            f"{self.plugin_name}目录硬链接扫描开始：目录={base_dir.as_posix()} "
+            f"候选inode={len(inode_keys)} 根目录={len(active_roots)}"
+        )
+        siblings: Dict[str, Path] = {}
+        scanned_files = 0
+        for root in active_roots:
+            for current_root, _, files in os.walk(root.as_posix()):
+                for filename in files:
+                    path = Path(current_root) / filename
+                    try:
+                        if path.is_symlink() or not path.is_file():
+                            continue
+                        if path.is_relative_to(base_dir):
+                            continue
+                        stat = path.stat()
+                    except Exception:
+                        continue
+                    scanned_files += 1
+                    if (int(stat.st_dev), int(stat.st_ino)) in inode_keys:
+                        siblings[path.as_posix()] = path
+        logger.info(
+            f"{self.plugin_name}目录硬链接扫描完成：目录={base_dir.as_posix()} "
+            f"扫描文件={scanned_files} 命中关联文件={len(siblings)}"
+        )
+        return list(siblings.values())
+
+    def _expand_media_targets_with_hardlinks(
+        self,
+        media_targets: List[Path],
+        roots: List[Path],
+        context: str,
+        enabled: bool,
+    ) -> List[Path]:
+        dedup: Dict[str, Path] = {}
+        for item in media_targets or []:
+            if item:
+                dedup[item.as_posix()] = item
+        if not enabled or not dedup:
+            return self._order_delete_targets(list(dedup.values()))
+
+        origin = list(dedup.values())
+        added_count = 0
+        for target in origin:
+            sibling_paths: List[Path] = []
+            try:
+                if target.exists() and target.is_dir() and not target.is_symlink():
+                    sibling_paths = self._collect_hardlink_siblings_in_directory(target, roots=roots)
+                else:
+                    sibling_paths = self._collect_hardlink_siblings(target, roots=roots)
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}硬链接扩展失败，已跳过目标：{target.as_posix()} err={err}")
+                sibling_paths = []
+            for sibling in sibling_paths:
+                key = sibling.as_posix()
+                if key in dedup:
+                    continue
+                dedup[key] = sibling
+                added_count += 1
+        if added_count > 0:
+            logger.warning(f"{self.plugin_name}触发硬链接兜底删除，新增 {added_count} 个关联文件：{context}")
+        else:
+            logger.info(f"{self.plugin_name}硬链接兜底扫描未发现新增关联文件：{context}")
+        return self._order_delete_targets(list(dedup.values()))
+
+    @staticmethod
+    def _order_delete_targets(paths: List[Path]) -> List[Path]:
+        files: List[Path] = []
+        dirs: List[Path] = []
+        for path in paths or []:
+            try:
+                if path.exists() and path.is_dir() and not path.is_symlink():
+                    dirs.append(path)
+                else:
+                    files.append(path)
+            except Exception:
+                files.append(path)
+        files.sort(key=lambda item: len(item.as_posix()), reverse=True)
+        dirs.sort(key=lambda item: len(item.as_posix()), reverse=True)
+        return files + dirs
+
+    def _download_file_media_paths(self, download_hash: Optional[str]) -> List[Path]:
+        if not self._download_oper or not download_hash:
+            return []
+        try:
+            files = self._download_oper.get_files_by_hash(download_hash) or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}查询下载文件记录失败，跳过提取本地路径 hash={download_hash}: {err}")
+            return []
+
+        allowed_exts = {str(ext).strip().lower() for ext in (getattr(settings, "RMT_MEDIAEXT", []) or []) if str(ext).strip()}
+        targets: Dict[str, Path] = {}
+        for fileinfo in files:
+            for raw_path in self._download_file_path_candidates(fileinfo):
+                local_path = self._resolve_local_media_path(raw_path)
+                if not local_path:
+                    continue
+                try:
+                    if not local_path.exists() and not local_path.is_symlink():
+                        continue
+                    if not local_path.is_file() and not local_path.is_symlink():
+                        continue
+                except Exception:
+                    continue
+                if allowed_exts and local_path.suffix.lower() not in allowed_exts:
+                    continue
+                targets[local_path.as_posix()] = local_path
+        return list(targets.values())
+
+    @staticmethod
+    def _download_file_path_candidates(fileinfo: Any) -> List[str]:
+        candidates: List[str] = []
+        fullpath = str(getattr(fileinfo, "fullpath", "") or "").strip()
+        if fullpath:
+            candidates.append(fullpath)
+        savepath = str(getattr(fileinfo, "savepath", "") or "").strip()
+        filepath = str(getattr(fileinfo, "filepath", "") or "").strip()
+        if savepath and filepath:
+            candidates.append((Path(savepath) / filepath).as_posix())
+        elif filepath:
+            file_path_obj = Path(filepath)
+            if file_path_obj.is_absolute():
+                candidates.append(file_path_obj.as_posix())
+        return candidates
+
+    def _resolve_download_context_fallback(
+        self,
+        download_hash: Optional[str],
+        downloader: Optional[str],
+        lookup_paths: Optional[List[Optional[Path]]],
+        context: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        hash_text = str(download_hash or "").strip() or None
+        downloader_text = str(downloader or "").strip() or None
+        if hash_text and downloader_text:
+            return hash_text, downloader_text
+        if not self._download_oper:
+            return hash_text, downloader_text
+
+        hash_votes: Dict[str, int] = {}
+        hash_downloader: Dict[str, str] = {}
+        checked_files = 0
+        for fullpath in self._iter_media_fullpaths_for_hash_lookup(lookup_paths):
+            checked_files += 1
+            for fileinfo in self._download_file_records_by_fullpath(fullpath):
+                file_hash = str(getattr(fileinfo, "download_hash", "") or "").strip()
+                if not file_hash:
+                    continue
+                hash_votes[file_hash] = hash_votes.get(file_hash, 0) + 1
+                file_downloader = str(getattr(fileinfo, "downloader", "") or "").strip()
+                if file_downloader and file_hash not in hash_downloader:
+                    hash_downloader[file_hash] = file_downloader
+
+        if not hash_text and hash_votes:
+            sorted_hashes = sorted(hash_votes.items(), key=lambda item: (-int(item[1]), str(item[0])))
+            hash_text = sorted_hashes[0][0]
+
+        if not hash_text:
+            get_by_path = getattr(self._download_oper, "get_by_path", None)
+            if callable(get_by_path):
+                for raw_path in lookup_paths or []:
+                    if not raw_path:
+                        continue
+                    try:
+                        history = get_by_path(Path(raw_path).as_posix())
+                    except Exception:
+                        history = None
+                    if not history:
+                        continue
+                    candidate_hash = str(getattr(history, "download_hash", "") or "").strip()
+                    if candidate_hash:
+                        hash_text = candidate_hash
+                        candidate_downloader = str(getattr(history, "downloader", "") or "").strip()
+                        if candidate_downloader:
+                            downloader_text = candidate_downloader
+                        break
+
+        if hash_text and not downloader_text:
+            downloader_text = hash_downloader.get(hash_text)
+            if not downloader_text:
+                get_by_hash = getattr(self._download_oper, "get_by_hash", None)
+                if callable(get_by_hash):
+                    try:
+                        history = get_by_hash(hash_text)
+                    except Exception:
+                        history = None
+                    if history:
+                        downloader_text = str(getattr(history, "downloader", "") or "").strip() or None
+            if not downloader_text and self._transfer_oper:
+                try:
+                    transfer_items = self._transfer_oper.list_by_hash(hash_text) or []
+                except Exception:
+                    transfer_items = []
+                for item in transfer_items:
+                    candidate = str(getattr(item, "downloader", "") or "").strip()
+                    if candidate:
+                        downloader_text = candidate
+                        break
+
+        if (not download_hash and hash_text) or (not downloader and downloader_text):
+            logger.info(
+                f"{self.plugin_name}下载记录兜底命中：目标={context} "
+                f"hash={hash_text or '-'} downloader={downloader_text or '-'} "
+                f"来源=媒体路径反查 扫描文件={checked_files}"
+            )
+        return hash_text, downloader_text
+
+    def _iter_media_fullpaths_for_hash_lookup(self, paths: Optional[List[Optional[Path]]]) -> List[str]:
+        allowed_exts = {
+            str(ext).strip().lower()
+            for ext in (getattr(settings, "RMT_MEDIAEXT", []) or [])
+            if str(ext).strip()
+        }
+        files: Dict[str, bool] = {}
+        for raw_path in paths or []:
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            try:
+                if not path.exists() and not path.is_symlink():
+                    continue
+            except Exception:
+                continue
+            try:
+                if path.is_file() or path.is_symlink():
+                    if allowed_exts and path.suffix.lower() not in allowed_exts:
+                        continue
+                    files[path.as_posix()] = True
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    for current_root, _, filenames in os.walk(path.as_posix()):
+                        for filename in filenames:
+                            file_path = Path(current_root) / filename
+                            try:
+                                if not file_path.is_file() and not file_path.is_symlink():
+                                    continue
+                            except Exception:
+                                continue
+                            if allowed_exts and file_path.suffix.lower() not in allowed_exts:
+                                continue
+                            files[file_path.as_posix()] = True
+            except Exception:
+                continue
+        return list(files.keys())
+
+    def _download_file_records_by_fullpath(self, fullpath: str) -> List[Any]:
+        if not self._download_oper or not fullpath:
+            return []
+
+        records: List[Any] = []
+        get_files_by_fullpath = getattr(self._download_oper, "get_files_by_fullpath", None)
+        if callable(get_files_by_fullpath):
+            try:
+                items = get_files_by_fullpath(fullpath) or []
+                if isinstance(items, list):
+                    records.extend(items)
+            except Exception:
+                pass
+
+        if not records:
+            get_file_by_fullpath = getattr(self._download_oper, "get_file_by_fullpath", None)
+            if callable(get_file_by_fullpath):
+                try:
+                    item = get_file_by_fullpath(fullpath)
+                except Exception:
+                    item = None
+                if item:
+                    records.append(item)
+
+        if not records:
+            get_hash_by_fullpath = getattr(self._download_oper, "get_hash_by_fullpath", None)
+            if callable(get_hash_by_fullpath):
+                try:
+                    fallback_hash = str(get_hash_by_fullpath(fullpath) or "").strip()
+                except Exception:
+                    fallback_hash = ""
+                if fallback_hash:
+                    records.append(type("HashOnly", (), {"download_hash": fallback_hash, "downloader": ""})())
+        return records
+
+    def _delete_local_item(self, path: Path, roots: List[Path]) -> bool:
+        path = Path(path)
+        if not path.exists() and not path.is_symlink():
+            return False
+        block_keyword = self._path_contains_block_keyword(path)
+        if block_keyword:
+            logger.warning(f"{self.plugin_name}命中禁止删除关键词，跳过删除：{path.as_posix()}（关键词：{block_keyword}）")
+            return False
+
+        allow_roots = self._effective_allow_roots(roots)
+        if not self._is_path_in_roots(path, allow_roots):
+            logger.warning(f"{self.plugin_name}跳过越界删除：{path.as_posix()}")
+            return False
+
+        if self._is_path_in_roots(path, self._block_paths()):
+            logger.warning(f"{self.plugin_name}命中黑名单，跳过删除：{path.as_posix()}")
+            return False
+
+        for root in allow_roots:
+            if path == root:
+                logger.warning(f"{self.plugin_name}跳过根目录删除：{path.as_posix()}")
+                return False
+
+        if self._dry_run:
+            if self._clean_empty_media_dirs:
+                self._current_run_dir_cleanup_dryrun_skips += 1
+            return True
+
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+                parent = path.parent
+            else:
+                path.unlink(missing_ok=True)
+                parent = path.parent
+        except Exception as err:
+            logger.error(f"{self.plugin_name}删除失败 {path.as_posix()}：{err}")
+            return False
+
+        self._delete_empty_parent_dirs(parent, allow_roots)
+        self._delete_no_media_parent_dirs(parent, allow_roots)
+        return True
+
+    def _delete_empty_parent_dirs(self, parent: Path, roots: List[Path]):
+        current = parent
+        root_set = {root.as_posix() for root in roots}
+        while current and current.exists():
+            if current.as_posix() in root_set:
+                break
+            block_keyword = self._path_contains_block_keyword(current)
+            if block_keyword:
+                logger.info(f"{self.plugin_name}命中禁止删除关键词，跳过目录回收：{current.as_posix()}（关键词：{block_keyword}）")
+                break
+            try:
+                if any(current.iterdir()):
+                    break
+                deleted_dir = current
+                current.rmdir()
+                self._record_dir_cleanup_item(self._current_run_empty_dirs_deleted, deleted_dir)
+                logger.info(f"{self.plugin_name}删除空目录：{deleted_dir.as_posix()}")
+                current = current.parent
+            except Exception:
+                break
+
+    def _delete_no_media_parent_dirs(self, parent: Path, roots: List[Path]):
+        if not self._clean_empty_media_dirs:
+            return
+        media_exts = self._media_ext_set_for_empty_dir_check()
+        if not media_exts:
+            return
+        library_roots = self._library_paths()
+        if not library_roots:
+            return
+        if not self._is_path_in_roots(parent, library_roots):
+            return
+        self._current_run_no_media_checks += 1
+
+        block_roots = self._block_paths()
+        protected_roots = {}
+        for root in list(roots) + list(library_roots):
+            protected_roots[root.as_posix()] = root
+        root_set = set(protected_roots.keys())
+
+        current = parent
+        while current and current.exists():
+            current_key = current.as_posix()
+            if current_key in root_set:
+                break
+            if not self._is_path_in_roots(current, roots):
+                break
+            if not self._is_path_in_roots(current, library_roots):
+                break
+            if self._is_path_in_roots(current, block_roots):
+                break
+            block_keyword = self._path_contains_block_keyword(current)
+            if block_keyword:
+                logger.info(f"{self.plugin_name}命中禁止删除关键词，跳过无媒体目录回收：{current.as_posix()}（关键词：{block_keyword}）")
+                break
+            try:
+                if not current.is_dir() or current.is_symlink():
+                    break
+            except Exception:
+                break
+            if self._dir_contains_media_file(current, media_exts):
+                break
+            try:
+                deleted_dir = current
+                shutil.rmtree(current)
+                self._record_dir_cleanup_item(self._current_run_no_media_dirs_deleted, deleted_dir)
+                logger.info(f"{self.plugin_name}删除无媒体文件目录：{deleted_dir.as_posix()}")
+                current = deleted_dir.parent
+            except Exception:
+                break
+
+    @staticmethod
+    def _dir_contains_media_file(directory: Path, media_exts: set) -> bool:
+        if not directory or not media_exts:
+            return False
+        try:
+            for current_root, _, files in os.walk(directory.as_posix()):
+                for filename in files:
+                    if Path(filename).suffix.lower() in media_exts:
+                        return True
+        except Exception:
+            return True
+        return False
+
+    @staticmethod
+    def _is_path_in_roots(path: Path, roots: List[Path]) -> bool:
+        for root in roots:
+            try:
+                if path == root or path.is_relative_to(root):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _collect_scrape_files(media_path: Path) -> List[Path]:
+        if not media_path:
+            return []
+        media_path = Path(media_path)
+        if media_path.is_dir():
+            # 目录级清理时由目录删除统一处理，避免重复统计。
+            return []
+        parent = media_path.parent
+        if not parent.exists() or not parent.is_dir():
+            return []
+
+        allowed_exts = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tbn", ".txt"}
+        result = []
+        for child in parent.iterdir():
+            if not child.is_file():
+                continue
+            if child.stem == media_path.stem and child.suffix.lower() in allowed_exts:
+                result.append(child)
+
+        return result
+
+    def _delete_torrent(self, downloader: str, torrent_hash: str) -> bool:
+        if not downloader or not torrent_hash:
+            return False
+        service = DownloaderHelper().get_service(name=downloader)
+        if not service or not service.instance:
+            return False
+        try:
+            return bool(
+                service.instance.delete_torrents(
+                    delete_file=self._delete_downloader_files,
+                    ids=torrent_hash,
+                )
+            )
+        except Exception as err:
+            logger.error(f"{self.plugin_name}删除下载器任务失败 {downloader}:{torrent_hash} - {err}")
+            return False
+
+    def _can_delete_torrent_in_media_flow(
+        self,
+        downloader: Optional[str],
+        torrent_hash: Optional[str],
+        target: str = "-",
+    ) -> bool:
+        if not self._clean_downloader_seed or not downloader or not torrent_hash:
+            return False
+        if not self._media_flow_seed_check:
+            return True
+        if self._seeding_days <= 0:
+            return True
+
+        service = DownloaderHelper().get_service(name=downloader)
+        if not service or not service.instance:
+            logger.warning(f"{self.plugin_name}媒体流程删种校验失败，下载器不可用，跳过删种：{target}")
+            return False
+
+        try:
+            torrents = service.instance.get_completed_torrents() or []
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}媒体流程读取下载器做种信息失败，跳过删种：{target} - {err}")
+            return False
+
+        seed_seconds = None
+        for torrent in torrents:
+            if self._torrent_hash(torrent) != torrent_hash:
+                continue
+            seed_seconds = self._torrent_seed_seconds(torrent)
+            break
+
+        if seed_seconds is None:
+            logger.warning(f"{self.plugin_name}媒体流程未找到种子做种信息，跳过删种：{target}")
+            return False
+
+        need_seconds = int(self._seeding_days * 86400)
+        if seed_seconds < need_seconds:
+            logger.info(
+                f"{self.plugin_name}媒体流程种子做种时长不足，跳过删种：{target} "
+                f"(当前{int(seed_seconds / 86400)}天 < 阈值{self._seeding_days}天)"
+            )
+            return False
+        return True
+
+    def _delete_transfer_history(self, download_hash: Optional[str], history: Any) -> int:
+        if not self._transfer_oper:
+            return 0
+
+        records = []
+        if download_hash:
+            records = self._transfer_oper.list_by_hash(download_hash)
+        elif history:
+            records = [history]
+
+        if not records:
+            logger.warning(f"{self.plugin_name}未找到可删除的整理记录，跳过")
+            return 0
+
+        removed = 0
+        visited = set()
+        for record in records:
+            rid = getattr(record, "id", None)
+            if not rid or rid in visited:
+                continue
+            visited.add(rid)
+            try:
+                self._transfer_oper.delete(rid)
+                removed += 1
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}删除整理记录失败，已跳过 id={rid}: {err}")
+
+        return removed
+
+    def _delete_download_history(self, download_hash: str) -> int:
+        if not self._download_oper:
+            return 0
+        if not download_hash:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过")
+            return 0
+
+        removed = 0
+        found_main = False
+
+        while True:
+            try:
+                history = self._download_oper.get_by_hash(download_hash)
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}查询下载记录失败，已跳过 hash={download_hash}: {err}")
+                break
+            if not history:
+                break
+            found_main = True
+            try:
+                self._download_oper.delete_history(history.id)
+                removed += 1
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}删除下载记录失败，已跳过 id={history.id}: {err}")
+
+        try:
+            files = self._download_oper.get_files_by_hash(download_hash)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}查询下载文件记录失败，已跳过 hash={download_hash}: {err}")
+            files = []
+        found_files = bool(files)
+        for fileinfo in files:
+            try:
+                self._download_oper.delete_downloadfile(fileinfo.id)
+                removed += 1
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}删除下载文件记录失败，已跳过 id={fileinfo.id}: {err}")
+
+        if not found_main and not found_files:
+            logger.warning(f"{self.plugin_name}未找到可删除的下载记录，跳过 hash={download_hash}")
+
+        return removed
+
+    @staticmethod
+    def _build_step_result(planned: int, done: int) -> dict:
+        planned_num = max(0, int(planned or 0))
+        done_num = max(0, int(done or 0))
+        return {
+            "planned": planned_num,
+            "done": done_num,
+            "failed": max(0, planned_num - done_num),
+        }
+
+    @staticmethod
+    def _collect_failed_steps(step_result: dict) -> List[str]:
+        return [
+            step for step, result in (step_result or {}).items()
+            if int((result or {}).get("failed", 0) or 0) > 0
+        ]
+
+    def _retry_queue_size(self) -> int:
+        return len(self.get_data("retry_queue") or [])
+
+    def _enqueue_retry(self, payload: dict):
+        if not payload or not payload.get("failed_steps"):
+            return
+        queue = self.get_data("retry_queue") or []
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        retry_key = payload.get("retry_key") or f"retry:{int(time.time() * 1000)}"
+        merged = False
+        for item in queue:
+            if item.get("retry_key") != retry_key:
+                continue
+            item_payload = item.get("payload") or {}
+            old_steps = set(item_payload.get("failed_steps") or [])
+            new_steps = set(payload.get("failed_steps") or [])
+            item_payload.update(payload)
+            item_payload["failed_steps"] = sorted(old_steps | new_steps)
+            item["payload"] = item_payload
+            item["next_run_at"] = now_text
+            merged = True
+            break
+        if not merged:
+            queue.append({
+                "id": f"{int(time.time() * 1000)}-{len(queue) + 1}",
+                "retry_key": retry_key,
+                "attempt": 0,
+                "created_at": now_text,
+                "next_run_at": now_text,
+                "payload": payload,
+            })
+        self.save_data("retry_queue", queue[-500:])
+
+    def _process_retry_queue(self, limit: int) -> List[dict]:
+        queue = self.get_data("retry_queue") or []
+        if not queue:
+            return []
+        now = datetime.now()
+        limit = max(1, int(limit or 1))
+        processed = 0
+        remain_queue = []
+        actions: List[dict] = []
+        for job in queue:
+            next_run_at = self._parse_datetime_text(job.get("next_run_at"))
+            if next_run_at and next_run_at > now:
+                remain_queue.append(job)
+                continue
+            if processed >= limit:
+                remain_queue.append(job)
+                continue
+            processed += 1
+            action, next_job = self._run_retry_job(job)
+            if action:
+                actions.append(action)
+            if next_job:
+                remain_queue.append(next_job)
+        self.save_data("retry_queue", remain_queue[-500:])
+        return actions
+
+    def _run_retry_job(self, job: dict) -> Tuple[Optional[dict], Optional[dict]]:
+        payload = job.get("payload") or {}
+        mode = payload.get("mode")
+        attempt = int(job.get("attempt", 0) or 0) + 1
+        if mode not in {"media", "torrent"}:
+            return None, None
+        try:
+            if mode == "media":
+                result = self._retry_media_payload(payload)
+            else:
+                result = self._retry_torrent_payload(payload)
+        except Exception as err:
+            logger.error(f"{self.plugin_name}失败补偿任务执行异常 mode={mode} target={payload.get('target')}: {err}", exc_info=True)
+            result = {
+                "steps": {},
+                "failed_steps": ["job_exception"],
+                "freed_bytes": 0,
+                "refresh_items": [],
+            }
+
+        failed_steps = result.get("failed_steps") or []
+        ok = len(failed_steps) == 0
+        action = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": f"失败补偿:{payload.get('trigger') or '-'}",
+            "target": payload.get("target") or "-",
+            "action": f"重试{'成功' if ok else '失败'}(第{attempt}次)；失败步骤：{','.join(failed_steps) if failed_steps else '无'}",
+            "freed_bytes": int(result.get("freed_bytes", 0) or 0),
+            "mode": "retry",
+            "steps": result.get("steps") or {},
+            "refresh_items": result.get("refresh_items") or [],
+        }
+        if ok:
+            return action, None
+
+        if attempt >= self._retry_max_attempts:
+            dead = self.get_data("retry_deadletter") or []
+            dead.append({
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "job": job,
+                "last_failed_steps": failed_steps,
+            })
+            self.save_data("retry_deadletter", dead[-200:])
+            return action, None
+
+        retry_job = dict(job)
+        retry_payload = dict(payload)
+        retry_payload["failed_steps"] = failed_steps
+        retry_job["payload"] = retry_payload
+        retry_job["attempt"] = attempt
+        next_run = datetime.now() + timedelta(minutes=max(1, self._retry_interval_minutes) * attempt)
+        retry_job["next_run_at"] = next_run.strftime("%Y-%m-%d %H:%M:%S")
+        return action, retry_job
+
+    def _retry_media_payload(self, payload: dict) -> dict:
+        failed = set(payload.get("failed_steps") or [])
+        media_path = Path(payload.get("media_path")) if payload.get("media_path") else None
+        media_targets = [Path(item) for item in (payload.get("media_targets") or []) if item]
+        if not media_targets and media_path:
+            media_targets = [media_path]
+        sidecars = [Path(item) for item in (payload.get("sidecars") or []) if item]
+        download_hash = payload.get("download_hash")
+        downloader = payload.get("downloader")
+        history_dest = payload.get("history_dest")
+        if self._should_skip_by_block_keywords(
+            paths=[media_path, history_dest] + [item.as_posix() for item in media_targets] + [item.as_posix() for item in sidecars],
+            context="失败补偿-媒体任务",
+        ) or self._has_recent_history_in_targets(
+            targets=[media_path, *media_targets, *sidecars],
+            download_hash=download_hash,
+        ):
+            zero_steps = {
+                "media": self._build_step_result(0, 0),
+                "scrape": self._build_step_result(0, 0),
+                "downloader": self._build_step_result(0, 0),
+                "transfer_history": self._build_step_result(0, 0),
+                "download_history": self._build_step_result(0, 0),
+            }
+            return {
+                "steps": zero_steps,
+                "failed_steps": [],
+                "freed_bytes": 0,
+                "refresh_items": [],
+            }
+        library_roots = self._library_paths()
+        delete_roots = self._media_delete_roots(library_roots)
+
+        freed_bytes = 0
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        planned_media = len(media_targets) if "media" in failed else 0
+        if planned_media:
+            for target in media_targets:
+                freed_bytes += self._path_size(target)
+                if (not target.exists() and not target.is_symlink()) or self._delete_local_item(target, delete_roots):
+                    removed_media += 1
+
+        planned_scrape = len(sidecars) if "scrape" in failed else 0
+        if planned_scrape:
+            for sidecar in sidecars:
+                freed_bytes += self._path_size(sidecar)
+                if (not sidecar.exists() and not sidecar.is_symlink()) or self._delete_local_item(sidecar, delete_roots):
+                    removed_scrape += 1
+
+        planned_downloader = 1 if "downloader" in failed and download_hash and downloader else 0
+        if planned_downloader and self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+            removed_downloader = 1
+
+        planned_transfer = 0
+        if "transfer_history" in failed:
+            history = self._transfer_oper.get_by_dest(history_dest) if history_dest and self._transfer_oper else None
+            planned_transfer = self._count_transfer_records(download_hash, history)
+            if planned_transfer > 0:
+                removed_transfer = self._delete_transfer_history(download_hash=download_hash, history=history)
+
+        planned_download = 0
+        if "download_history" in failed and download_hash:
+            planned_download = self._count_download_records(download_hash)
+            if planned_download > 0:
+                removed_download = self._delete_download_history(download_hash)
+
+        steps = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        refresh_items = []
+        history = self._transfer_oper.get_by_dest(history_dest) if history_dest and self._transfer_oper else None
+        if history:
+            refresh_item = self._build_refresh_item(history=history, target_path=history_dest)
+            if refresh_item:
+                refresh_items.append(refresh_item)
+        return {
+            "steps": steps,
+            "failed_steps": self._collect_failed_steps(steps),
+            "freed_bytes": freed_bytes,
+            "refresh_items": refresh_items,
+        }
+
+    def _retry_torrent_payload(self, payload: dict) -> dict:
+        failed = set(payload.get("failed_steps") or [])
+        download_hash = payload.get("download_hash")
+        downloader = payload.get("downloader")
+        media_targets = [Path(item) for item in (payload.get("media_targets") or []) if item]
+        sidecar_targets = [Path(item) for item in (payload.get("sidecar_targets") or []) if item]
+        history_dests = [item for item in (payload.get("history_dests") or []) if item]
+        if self._should_skip_by_block_keywords(
+            paths=history_dests + [item.as_posix() for item in media_targets] + [item.as_posix() for item in sidecar_targets],
+            context=f"失败补偿-下载器任务({downloader}:{download_hash})",
+        ) or self._has_recent_history_in_targets(
+            targets=[*media_targets, *sidecar_targets, *[Path(item) for item in history_dests]],
+            download_hash=download_hash,
+        ):
+            zero_steps = {
+                "media": self._build_step_result(0, 0),
+                "scrape": self._build_step_result(0, 0),
+                "downloader": self._build_step_result(0, 0),
+                "transfer_history": self._build_step_result(0, 0),
+                "download_history": self._build_step_result(0, 0),
+            }
+            return {
+                "steps": zero_steps,
+                "failed_steps": [],
+                "freed_bytes": 0,
+                "refresh_items": [],
+            }
+        library_roots = self._library_paths()
+        delete_roots = self._media_delete_roots(library_roots)
+
+        freed_bytes = 0
+        removed_media = 0
+        removed_scrape = 0
+        removed_downloader = 0
+        removed_transfer = 0
+        removed_download = 0
+
+        planned_media = len(media_targets) if "media" in failed else 0
+        if planned_media:
+            for path in media_targets:
+                freed_bytes += self._path_size(path)
+                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, delete_roots):
+                    removed_media += 1
+
+        planned_scrape = len(sidecar_targets) if "scrape" in failed else 0
+        if planned_scrape:
+            for path in sidecar_targets:
+                freed_bytes += self._path_size(path)
+                if (not path.exists() and not path.is_symlink()) or self._delete_local_item(path, delete_roots):
+                    removed_scrape += 1
+
+        planned_downloader = 1 if "downloader" in failed and downloader and download_hash else 0
+        if planned_downloader and self._delete_torrent(downloader=downloader, torrent_hash=download_hash):
+            removed_downloader = 1
+
+        planned_transfer = 0
+        if "transfer_history" in failed:
+            planned_transfer = self._count_transfer_records(download_hash, None)
+            if planned_transfer > 0:
+                removed_transfer = self._delete_transfer_history(download_hash=download_hash, history=None)
+
+        planned_download = 0
+        if "download_history" in failed and download_hash:
+            planned_download = self._count_download_records(download_hash)
+            if planned_download > 0:
+                removed_download = self._delete_download_history(download_hash)
+
+        steps = {
+            "media": self._build_step_result(planned_media, removed_media),
+            "scrape": self._build_step_result(planned_scrape, removed_scrape),
+            "downloader": self._build_step_result(planned_downloader, removed_downloader),
+            "transfer_history": self._build_step_result(planned_transfer, removed_transfer),
+            "download_history": self._build_step_result(planned_download, removed_download),
+        }
+        refresh_items = []
+        for dest in history_dests:
+            history = self._transfer_oper.get_by_dest(dest) if self._transfer_oper else None
+            if not history:
+                continue
+            refresh_item = self._build_refresh_item(history=history, target_path=dest)
+            if refresh_item:
+                refresh_items.append(refresh_item)
+        return {
+            "steps": steps,
+            "failed_steps": self._collect_failed_steps(steps),
+            "freed_bytes": freed_bytes,
+            "refresh_items": refresh_items,
+        }
+
+    @staticmethod
+    def _parse_datetime_text(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    def _collect_refresh_items(self, actions: List[dict]) -> List[RefreshMediaItem]:
+        if not actions:
+            return []
+
+        dedup: Dict[str, RefreshMediaItem] = {}
+        for action in actions:
+            for item in action.get("refresh_items") or []:
+                if isinstance(item, RefreshMediaItem):
+                    refresh_item = item
+                elif isinstance(item, dict):
+                    try:
+                        refresh_item = RefreshMediaItem(**item)
+                    except Exception:
+                        continue
+                else:
+                    continue
+                key_path = Path(refresh_item.target_path) if refresh_item.target_path else None
+                group_key = key_path.parent.as_posix() if key_path and key_path.suffix else (key_path.as_posix() if key_path else "")
+                key = "|".join([
+                    str(refresh_item.title or ""),
+                    str(refresh_item.year or ""),
+                    str(refresh_item.type or ""),
+                    group_key,
+                ])
+                dedup[key] = refresh_item
+        return list(dedup.values())
+
+    def _build_refresh_item(self, history: Any, target_path: Any) -> Optional[dict]:
+        if not history:
+            return None
+
+        mtype = getattr(history, "type", None)
+        title = getattr(history, "title", None)
+        year = getattr(history, "year", None)
+        category = getattr(history, "category", None)
+        dest = target_path or getattr(history, "dest", None)
+        if not mtype or not title or not dest:
+            return None
+        mtype_text = self._sanitize_for_json(mtype)
+        category_text = self._sanitize_for_json(category)
+        year_text = self._sanitize_for_json(year)
+        dest_text = self._sanitize_for_json(Path(str(dest)))
+        if not mtype_text or not dest_text:
+            return None
+        return {
+            "title": str(title),
+            "year": year_text,
+            "type": str(mtype_text),
+            "category": str(category_text) if category_text else None,
+            "target_path": str(dest_text),
+        }
+
+    def _refresh_media_servers(self, refresh_items: Optional[List[RefreshMediaItem]] = None) -> int:
+        media_servers = self._effective_media_servers()
+        services = MediaServerHelper().get_services(
+            name_filters=media_servers if media_servers else None
+        )
+        refreshed = 0
+        refresh_items = refresh_items or []
+        for server_name, service in services.items():
+            instance = service.instance
+            if not instance or not hasattr(instance, "refresh_root_library"):
+                continue
+            try:
+                state = None
+                if self._refresh_mode == "item" and refresh_items and hasattr(instance, "refresh_library_by_items"):
+                    batch_failed = False
+                    for i in range(0, len(refresh_items), max(1, self._refresh_batch_size)):
+                        batch = refresh_items[i:i + max(1, self._refresh_batch_size)]
+                        batch_state = instance.refresh_library_by_items(batch)
+                        if batch_state is False:
+                            batch_failed = True
+                            logger.warning(f"{self.plugin_name}定向刷新失败，准备回退整库刷新：{server_name}")
+                            break
+                    if batch_failed and hasattr(instance, "refresh_root_library"):
+                        state = instance.refresh_root_library()
+                    else:
+                        state = True
+                else:
+                    state = instance.refresh_root_library()
+                if state is not False:
+                    refreshed += 1
+                    logger.info(f"{self.plugin_name}已刷新媒体服务器：{server_name}")
+            except Exception as err:
+                logger.error(f"{self.plugin_name}刷新媒体服务器失败 {server_name}：{err}")
+        return refreshed
+
+    @staticmethod
+    def _torrent_hash(torrent: Any) -> Optional[str]:
+        if hasattr(torrent, "get"):
+            for key in ("hash", "hashString", "hash_string"):
+                try:
+                    value = torrent.get(key)
+                except Exception:
+                    value = None
+                if value:
+                    return str(value)
+        for attr in ("hashString", "hash", "hash_string"):
+            value = getattr(torrent, attr, None)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _torrent_name(torrent: Any) -> str:
+        if hasattr(torrent, "get"):
+            try:
+                value = torrent.get("name") or torrent.get("title")
+            except Exception:
+                value = None
+            if value:
+                return str(value)
+        return str(getattr(torrent, "name", None) or getattr(torrent, "title", "") or "")
+
+    @staticmethod
+    def _torrent_seed_seconds(torrent: Any) -> int:
+        now = int(time.time())
+
+        def _to_ts(value: Any) -> int:
+            if value is None:
+                return 0
+            if hasattr(value, "timestamp"):
+                try:
+                    return int(value.timestamp())
+                except Exception:
+                    return 0
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        if hasattr(torrent, "get"):
+            completed = 0
+            for key in ("completion_on", "completed_on", "doneDate", "date_done"):
+                try:
+                    value = torrent.get(key)
+                except Exception:
+                    value = None
+                completed = _to_ts(value)
+                if completed > 0:
+                    break
+            if completed <= 0:
+                return 0
+            return max(0, now - completed)
+
+        for attr in ("date_done", "doneDate", "completion_on", "completed_on"):
+            completed = _to_ts(getattr(torrent, attr, None))
+            if completed > 0:
+                return max(0, now - completed)
+
+        return 0
+
+    @staticmethod
+    def _torrent_state_text(torrent: Any) -> str:
+        value = None
+        if hasattr(torrent, "get"):
+            try:
+                value = torrent.get("state") or torrent.get("status")
+            except Exception:
+                value = None
+        if value is None:
+            value = getattr(torrent, "state", None) or getattr(torrent, "status", None)
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _torrent_progress_percent(torrent: Any) -> float:
+        value = None
+        if hasattr(torrent, "get"):
+            try:
+                value = (
+                    torrent.get("progress")
+                    or torrent.get("percentDone")
+                    or torrent.get("percent_done")
+                )
+            except Exception:
+                value = None
+        if value is None:
+            value = (
+                getattr(torrent, "progress", None)
+                or getattr(torrent, "percentDone", None)
+                or getattr(torrent, "percent_done", None)
+                or getattr(torrent, "percent_done", None)
+            )
+        try:
+            number = float(value)
+        except Exception:
+            return 0.0
+        if number <= 1.001:
+            return max(0.0, min(100.0, number * 100.0))
+        return max(0.0, min(100.0, number))
+
+    def _is_torrent_paused(self, torrent: Any) -> bool:
+        state = self._torrent_state_text(torrent)
+        if not state:
+            return False
+        return state.startswith("paused") or state == "stopped"
+
+    def _is_torrent_downloading(self, torrent: Any) -> bool:
+        state = self._torrent_state_text(torrent)
+        if not state:
+            return False
+        downloading_states = {
+            "downloading", "download_pending", "checking", "check_pending",
+            "metadl", "forceddl", "stalleddl", "queueddl",
+        }
+        return state in downloading_states
+
+    def _is_torrent_completed(self, torrent: Any) -> bool:
+        if self._torrent_progress_percent(torrent) >= 99.9:
+            return True
+        state = self._torrent_state_text(torrent)
+        completed_states = {
+            "seeding", "seed_pending", "uploading", "stalledup",
+            "queuedup", "forcedup", "pausedup", "stopped",
+            "completed", "complete",
+        }
+        if state in completed_states:
+            return True
+        return self._torrent_seed_seconds(torrent) > 0
+
+    @staticmethod
+    def _format_size(size: float) -> str:
+        if not size:
+            return "0 B"
+
+        units = ["B", "KB", "MB", "GB", "TB", "PB"]
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.2f} {unit}"
+            value /= 1024
+
+        return f"{value:.2f} PB"
+
+    @staticmethod
+    def _safe_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _build_usage_card(self, title: str, usage: dict, enabled: bool, mode: str, value: float) -> dict:
+        paths = usage.get("paths") or []
+        trigger = self._is_threshold_hit(usage, mode, value) if enabled else False
+        status_text = "触发清理" if trigger else "状态正常"
+        status_type = "error" if trigger else "success"
+        if not enabled:
+            status_text = "未启用监听"
+            status_type = "info"
+        used_percent = float(usage.get("used_percent", 0) or 0)
+        used_percent = max(0.0, min(100.0, used_percent))
+        free_percent = float(usage.get("free_percent", 0) or 0)
+        free_percent = max(0.0, min(100.0, free_percent))
+        progress_color = "error" if trigger else ("success" if enabled else "info")
+        path_texts = [str(item) for item in paths]
+        path_tooltip_text = "\n".join(path_texts) if path_texts else "无目录路径"
+        path_chip_items = [
+            {
+                "component": "VChip",
+                "props": {
+                    "size": "x-small",
+                    "variant": "outlined",
+                    "color": "primary",
+                    "label": True,
+                    "class": "mr-1 mb-1",
+                    "style": "max-width:100%;",
+                },
+                "text": path,
+            }
+            for path in path_texts
+        ]
+        path_content = [
+            {
+                "component": "div",
+                "props": {
+                    "class": "d-flex flex-wrap align-center",
+                    "style": "max-height:72px; overflow:hidden;",
+                    "title": path_tooltip_text,
+                },
+                "content": path_chip_items,
+            }
+        ]
+        if not path_chip_items:
+            path_content = [
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis"},
+                    "text": "无目录路径",
+                }
+            ]
+        # 无法在后端精确获知前端换行结果，使用保守阈值避免“明明全显示却仍出现省略号”。
+        elif len(path_chip_items) > 8:
+            path_content.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis", "title": path_tooltip_text},
+                    "text": "...",
+                }
+            )
+
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 6},
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": {"variant": "outlined", "class": "h-100"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "py-1 px-2"},
+                            "content": [
+                                {
+                                    "component": "VRow",
+                                    "props": {"align": "center", "noGutters": True},
+                                    "content": [
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 8},
+                                            "content": [
+                                                {
+                                                    "component": "VRow",
+                                                    "props": {"align": "center", "noGutters": True},
+                                                    "content": [
+                                                        {
+                                                            "component": "VCol",
+                                                            "props": {"cols": 7},
+                                                            "content": [
+                                                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis text-truncate"}, "text": title}
+                                                            ],
+                                                        },
+                                                        {
+                                                            "component": "VCol",
+                                                            "props": {"cols": 5, "class": "text-right"},
+                                                            "content": [
+                                                                {"component": "VChip", "props": {"size": "x-small", "color": status_type, "variant": "tonal"}, "text": status_text}
+                                                            ],
+                                                        },
+                                                    ],
+                                                }
+                                            ],
+                                        },
+                                        {
+                                            "component": "VCol",
+                                            "props": {"cols": 4, "class": "text-right"},
+                                            "content": [{"component": "div", "props": {"class": "text-body-2 font-weight-bold text-truncate"}, "text": usage.get("free_text", "0 B")}],
+                                        },
+                                    ],
+                                },
+                                {"component": "div", "props": {"class": "text-caption mt-1 text-medium-emphasis text-truncate"}, "text": f"已用 {usage.get('used_text', '0 B')} ({used_percent:.1f}%) | 阈值 {self._threshold_text(mode, value)}"},
+                                {"component": "VProgressLinear", "props": {"modelValue": used_percent, "height": 4, "rounded": True, "striped": True, "stream": True, "color": progress_color}},
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption mt-1 text-medium-emphasis text-truncate"},
+                                    "text": f"总 {usage.get('total_text', '0 B')} | 可用 {free_percent:.1f}% | 路径 {len(paths)}",
+                                },
+                                {"component": "div", "props": {"class": "text-caption mt-1 font-weight-bold"}, "text": "目录路径"},
+                                {"component": "div", "props": {"class": "mt-1"}, "content": path_content},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def _count_transfer_records(self, download_hash: Optional[str], history: Any) -> int:
+        if not self._transfer_oper:
+            return 0
+        if download_hash:
+            return len(self._transfer_oper.list_by_hash(download_hash) or [])
+        if history:
+            return 1
+        return 0
+
+    def _count_download_records(self, download_hash: Optional[str]) -> int:
+        if not self._download_oper or not download_hash:
+            return 0
+        try:
+            count = 0
+            if self._download_oper.get_by_hash(download_hash):
+                count += 1
+            count += len(self._download_oper.get_files_by_hash(download_hash) or [])
+            return count
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}统计下载记录数量失败，已忽略 hash={download_hash}: {err}")
+            return 0
+
+    @staticmethod
+    def _path_size(path: Path) -> int:
+        try:
+            if path and path.exists() and path.is_file():
+                return int(path.stat().st_size)
+            if path and path.exists() and path.is_dir():
+                try:
+                    return int(SystemUtils.get_directory_size(path))
+                except Exception:
+                    total = 0
+                    for current_root, _, files in os.walk(path.as_posix()):
+                        for filename in files:
+                            item = Path(current_root) / filename
+                            try:
+                                if item.is_symlink() or not item.is_file():
+                                    continue
+                                total += int(item.stat().st_size)
+                            except Exception:
+                                continue
+                    return int(total)
+        except Exception:
+            return 0
+        return 0
+
+    def _is_history_recent(self, history: Any) -> bool:
+        if not history or self._protect_recent_days <= 0:
+            return False
+        date_text = getattr(history, "date", None)
+        if not date_text:
+            return False
+        try:
+            history_dt = datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S")
+            return (datetime.now() - history_dt).days < self._protect_recent_days
+        except Exception:
+            return False
+
+    def _is_in_cooldown(self) -> bool:
+        if self._cooldown_minutes <= 0:
+            return False
+        last_run = self.get_data("last_run_at")
+        if not last_run:
+            return False
+        try:
+            last_dt = datetime.strptime(last_run, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return False
+        return (datetime.now() - last_dt).total_seconds() < self._cooldown_minutes * 60
+
+    def _get_daily_freed_bytes(self) -> int:
+        data = self.get_data("daily_freed") or {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        if data.get("date") != today:
+            return 0
+        return int(data.get("bytes", 0) or 0)
+
+    def _update_daily_freed_bytes(self, add_bytes: int):
+        if add_bytes <= 0:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        current = self._get_daily_freed_bytes()
+        self.save_data("daily_freed", {"date": today, "bytes": current + int(add_bytes)})
+
+    def _is_daily_limit_reached(self) -> bool:
+        if self._max_gb_per_day <= 0:
+            return False
+        limit_bytes = int(self._max_gb_per_day * (1024 ** 3))
+        return self._get_daily_freed_bytes() >= limit_bytes
+
+    def _is_run_bytes_limit_reached(self, next_bytes: int) -> bool:
+        if self._max_gb_per_run <= 0:
+            return False
+        limit_bytes = int(self._max_gb_per_run * (1024 ** 3))
+        return int(next_bytes) > limit_bytes
+
+    def _is_daily_bytes_limit_reached(self, next_bytes: int) -> bool:
+        if self._max_gb_per_day <= 0:
+            return False
+        limit_bytes = int(self._max_gb_per_day * (1024 ** 3))
+        return self._get_daily_freed_bytes() + int(self._current_run_freed_bytes) + int(next_bytes) > limit_bytes
+
+    def _is_run_limit_reached(self, actions: List[dict]) -> bool:
+        if self._max_delete_items > 0 and len(actions) >= self._max_delete_items:
+            return True
+        if self._max_gb_per_run > 0:
+            return int(self._current_run_freed_bytes) >= int(self._max_gb_per_run * (1024 ** 3))
+        return False
+
+    def _effective_allow_roots(self, fallback_roots: List[Path]) -> List[Path]:
+        # 白名单策略已弃用，始终以媒体目录/推导根目录为删除边界。
+        return fallback_roots
+
+    def _allow_paths(self) -> List[Path]:
+        return self._normalize_paths(self._path_allowlist)
+
+    def _block_paths(self) -> List[Path]:
+        return self._normalize_paths(self._path_blocklist)
+
+    def _block_keywords(self) -> List[str]:
+        return self._normalize_keyword_list(self._path_block_keywords)
+
+    def _path_contains_block_keyword(self, path: Any) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            path_text = Path(str(path)).as_posix()
+        except Exception:
+            path_text = str(path)
+        path_text_lc = path_text.lower()
+        for keyword in self._block_keywords():
+            key = str(keyword or "").strip().lower()
+            if key and key in path_text_lc:
+                return keyword
+        return None
+
+    def _should_skip_by_block_keywords(self, paths: List[Any], context: str) -> bool:
+        for raw_path in paths or []:
+            keyword = self._path_contains_block_keyword(raw_path)
+            if not keyword:
+                continue
+            try:
+                path_text = Path(str(raw_path)).as_posix()
+            except Exception:
+                path_text = str(raw_path)
+            logger.info(
+                f"{self.plugin_name}命中禁止删除关键词，整条跳过："
+                f"关键词={keyword} 路径={path_text} 场景={context}"
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_paths(raw_paths: List[str]) -> List[Path]:
+        unique: Dict[str, Path] = {}
+        for raw in raw_paths or []:
+            try:
+                path = Path(raw).expanduser()
+                unique[path.as_posix()] = path
+            except Exception:
+                continue
+        return list(unique.values())
+
+    def _parse_path_list(self, raw: Any) -> List[str]:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            values = [str(item).strip() for item in raw]
+        else:
+            text = str(raw).replace(",", "\n")
+            values = [line.strip() for line in text.splitlines()]
+        return [item for item in values if item]
+
+    def _parse_keyword_list(self, raw: Any) -> List[str]:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            values = []
+            for item in raw:
+                values.extend(re.split(r"[,，;\n]+", str(item or "")))
+        else:
+            values = re.split(r"[,，;\n]+", str(raw or ""))
+        keywords = [str(item).strip() for item in values if str(item).strip()]
+        return self._normalize_keyword_list(keywords)
+
+    @staticmethod
+    def _normalize_keyword_list(raw_keywords: List[str]) -> List[str]:
+        dedup: Dict[str, str] = {}
+        for item in raw_keywords or []:
+            keyword = str(item or "").strip()
+            if not keyword:
+                continue
+            key = keyword.lower()
+            if key not in dedup:
+                dedup[key] = keyword
+        return list(dedup.values())
+
+    @staticmethod
+    def _split_media_ext_values(raw: Any) -> List[str]:
+        values = re.split(r"[,\n;，]+", str(raw or ""))
+        result: List[str] = []
+        for item in values:
+            ext = str(item).strip().lower().lstrip(".")
+            if ext:
+                result.append(ext)
+        return result
+
+    def _normalize_media_ext_config(self, raw: Any, default: Optional[str] = None) -> str:
+        base_text = str(raw or "").strip()
+        if not base_text:
+            base_text = str(default or "").strip()
+        items = self._split_media_ext_values(base_text)
+        if not items:
+            items = self._split_media_ext_values(self._empty_media_exts)
+        dedup: Dict[str, bool] = {}
+        for ext in items:
+            dedup[ext] = True
+        return ",".join(dedup.keys())
+
+    def _media_ext_set_for_empty_dir_check(self) -> set:
+        items = self._split_media_ext_values(self._empty_media_exts)
+        return {f".{ext}" for ext in items if ext}
+
+    def _parse_media_path_mappings(self, raw_mappings: List[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
+        normalized_lines: List[str] = []
+        rules: List[Tuple[str, str]] = []
+        seen = set()
+        for raw in raw_mappings or []:
+            line = str(raw).strip()
+            if not line:
+                continue
+            if "=>" in line:
+                server_root, local_root = line.split("=>", 1)
+            elif ":" in line:
+                server_root, local_root = line.rsplit(":", 1)
+            else:
+                logger.warning(f"{self.plugin_name}路径映射格式无效，已忽略：{line}")
+                continue
+
+            server_root = self._normalize_mapping_root(server_root)
+            local_root = self._normalize_mapping_root(local_root)
+            if not server_root or not local_root:
+                continue
+            key = (server_root, local_root)
+            if key in seen:
+                continue
+            seen.add(key)
+            rules.append(key)
+            normalized_lines.append(f"{server_root}:{local_root}")
+        return normalized_lines, rules
+
+    @staticmethod
+    def _normalize_mapping_root(raw_path: Any) -> str:
+        if not raw_path:
+            return ""
+        text = Path(str(raw_path).strip()).expanduser().as_posix().strip()
+        if len(text) > 1 and text.endswith("/"):
+            text = text.rstrip("/")
+        return text
+
+    @staticmethod
+    def _replace_path_root(path_text: str, src_root: str, dst_root: str) -> str:
+        if not path_text or not src_root or not dst_root:
+            return path_text
+        try:
+            path = Path(path_text)
+            src = Path(src_root)
+            dst = Path(dst_root)
+            if path == src:
+                return dst.as_posix()
+            relative = path.relative_to(src)
+            return (dst / relative).as_posix()
+        except Exception:
+            return path_text
+
+    def _history_dest_candidates(self, media_path: Path) -> List[str]:
+        base = Path(media_path).expanduser().as_posix()
+        candidates = [base]
+        for server_root, local_root in self._media_path_rules:
+            mapped = self._replace_path_root(base, local_root, server_root)
+            if mapped not in candidates:
+                candidates.append(mapped)
+        return candidates
+
+    def _find_transfer_history_by_media_path(self, media_path: Optional[Path]) -> Optional[Any]:
+        if not media_path or not self._transfer_oper:
+            return None
+        for candidate_dest in self._history_dest_candidates(media_path):
+            history = self._transfer_oper.get_by_dest(candidate_dest)
+            if history:
+                return history
+        return None
+
+    def _resolve_media_cleanup_target(
+        self,
+        media_path: Optional[Path],
+        history: Any,
+        roots: List[Path],
+    ) -> Optional[Path]:
+        if not media_path:
+            return None
+        cleanup_target = self._media_cleanup_dir_from_path(media_path) or media_path
+        media_type = self._history_media_type_key(history)
+        if media_type == "tv":
+            season_root = self._tv_season_root_from_media_path(cleanup_target, history=history)
+            if not season_root:
+                logger.warning(f"{self.plugin_name}未能识别电视剧季目录，跳过媒体删除：{cleanup_target.as_posix()}")
+                return None
+            if season_root.as_posix() != cleanup_target.as_posix():
+                logger.info(
+                    f"{self.plugin_name}电视剧清理目标切换为季目录："
+                    f"{cleanup_target.as_posix()} -> {season_root.as_posix()}"
+                )
+            else:
+                logger.info(f"{self.plugin_name}电视剧清理目标识别为季目录：{season_root.as_posix()}")
+            cleanup_target = season_root
+        elif media_type == "movie" and cleanup_target.as_posix() != Path(media_path).as_posix():
+            logger.info(f"{self.plugin_name}电影清理目标目录：{cleanup_target.as_posix()}")
+
+        if not self._is_path_in_roots(cleanup_target, roots):
+            return cleanup_target
+        for root in roots:
+            if cleanup_target == root:
+                logger.warning(f"{self.plugin_name}清理目标命中根目录，回退原始路径：{Path(media_path).as_posix()}")
+                return media_path
+        return cleanup_target
+
+    @staticmethod
+    def _media_cleanup_dir_from_path(media_path: Optional[Path]) -> Optional[Path]:
+        if not media_path:
+            return None
+        path = Path(media_path)
+        if path.is_dir():
+            return path
+        parent = path.parent
+        if not parent:
+            return None
+        return parent
+
+    def _tv_season_root_from_media_path(self, media_path: Path, history: Any) -> Optional[Path]:
+        path = Path(media_path)
+        if path.is_dir():
+            node = path
+        else:
+            parent = path.parent
+            if not parent:
+                return None
+            node = parent
+
+        season_num = self._extract_season_number(getattr(history, "seasons", None)) if history else None
+        if self._looks_like_tv_season_dir(node.name, season=season_num):
+            return node
+
+        if season_num is None:
+            return None
+
+        if node.exists() and node.is_dir():
+            matches: List[Path] = []
+            for child in node.iterdir():
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                if self._looks_like_tv_season_dir(child.name, season=season_num):
+                    matches.append(child)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                matches.sort(key=lambda item: item.as_posix())
+                return matches[0]
+        return None
+
+    @staticmethod
+    def _looks_like_tv_season_dir(name: Any, season: Optional[int] = None) -> bool:
+        season_num = DiskCleaner._extract_season_from_dir_name(name)
+        if season_num is None:
+            return False
+        if season is None:
+            return True
+        return int(season_num) == int(season)
+
+    @staticmethod
+    def _extract_season_from_dir_name(name: Any) -> Optional[int]:
+        text = str(name or "").strip()
+        if not text:
+            return None
+        normalized = re.sub(r"[._-]+", " ", text).strip().lower()
+        compact = re.sub(r"\s+", "", normalized)
+        english = re.match(r"^(season|seasons?)\s*(\d+)$", normalized)
+        if english:
+            return int(english.group(2))
+        s_style = re.match(r"^s(\d{1,2})$", compact)
+        if s_style:
+            return int(s_style.group(1))
+        chinese = re.match(r"^第\s*(\d+)\s*季$", text)
+        if chinese:
+            return int(chinese.group(1))
+        return None
+
+    def _resolve_local_media_path(self, dest_path: Any) -> Optional[Path]:
+        if not dest_path:
+            return None
+        path_text = Path(str(dest_path)).expanduser().as_posix()
+        for server_root, local_root in self._media_path_rules:
+            mapped = self._replace_path_root(path_text, server_root, local_root)
+            if mapped != path_text:
+                return Path(mapped)
+        return Path(path_text)
+
+    def _normalize_config(self):
+        self._clear_history = bool(self._clear_history)
+        self._library_scope_filter_notice_logged = False
+        if self._trigger_flow not in (
+            "flow_library_mp_downloader",
+            "flow_downloader_mp_library",
+            "flow_transfer_oldest",
+        ):
+            self._trigger_flow = "flow_library_mp_downloader"
+        if self._download_threshold_mode not in ("size", "percent"):
+            self._download_threshold_mode = "size"
+        if self._library_threshold_mode not in ("size", "percent"):
+            self._library_threshold_mode = "size"
+
+        self._download_threshold_value = max(
+            0.0,
+            self._parse_threshold_value(self._download_threshold_value, self._download_threshold_mode),
+        )
+        self._library_threshold_value = max(
+            0.0,
+            self._parse_threshold_value(self._library_threshold_value, self._library_threshold_mode),
+        )
+        if self._download_threshold_mode == "percent":
+            self._download_threshold_value = min(100.0, self._download_threshold_value)
+        if self._library_threshold_mode == "percent":
+            self._library_threshold_value = min(100.0, self._library_threshold_value)
+
+        self._cooldown_minutes = max(0, int(self._cooldown_minutes))
+        self._seeding_days = max(0, int(self._seeding_days))
+        self._max_delete_items = max(1, min(50, int(self._max_delete_items)))
+        self._max_gb_per_run = max(0.0, self._safe_float(self._max_gb_per_run, 50.0))
+        self._max_gb_per_day = max(0.0, self._safe_float(self._max_gb_per_day, 200.0))
+        self._protect_recent_days = max(0, int(self._protect_recent_days))
+        self._media_cleanup_priority = self._normalize_media_priority(self._media_cleanup_priority)
+        self._tv_complete_only = bool(self._tv_complete_only)
+        self._media_flow_seed_check = bool(self._media_flow_seed_check)
+        self._force_hardlink_cleanup = bool(self._force_hardlink_cleanup)
+        self._clean_empty_media_dirs = bool(self._clean_empty_media_dirs)
+        self._empty_media_exts = self._normalize_media_ext_config(
+            self._empty_media_exts,
+            default="mp4,mkv,ts,iso,rmvb,avi,mov,mpeg,mpg,wmv,3gp,asf,m4v,flv,m2ts,tp,f4v",
+        )
+        self._refresh_mode = "item" if self._refresh_mode not in ("item", "root") else self._refresh_mode
+        self._refresh_batch_size = max(1, min(200, int(self._refresh_batch_size)))
+        self._retry_max_attempts = max(1, min(20, int(self._retry_max_attempts)))
+        self._retry_interval_minutes = max(1, min(1440, int(self._retry_interval_minutes)))
+        self._retry_batch_size = max(1, min(50, int(self._retry_batch_size)))
+        self._downloaders = [str(item).strip() for item in (self._downloaders or []) if str(item).strip()]
+        self._media_servers = [str(item).strip() for item in (self._media_servers or []) if str(item).strip()]
+        normalized_libraries: List[str] = []
+        for item in self._media_libraries or []:
+            server_name, library_id = self._parse_library_key(item)
+            if not server_name or not library_id:
+                continue
+            normalized_libraries.append(f"{server_name}::{library_id}")
+        dedup_libraries: Dict[str, bool] = {}
+        for item in normalized_libraries:
+            dedup_libraries[item] = True
+        self._media_libraries = list(dedup_libraries.keys())
+        self._path_allowlist = self._parse_path_list(self._path_allowlist)
+        self._path_blocklist = self._parse_path_list(self._path_blocklist)
+        self._path_block_keywords = self._parse_keyword_list(self._path_block_keywords)
+        self._media_path_mapping = self._parse_path_list(self._media_path_mapping)
+        self._media_path_mapping, self._media_path_rules = self._parse_media_path_mappings(self._media_path_mapping)
+        self._library_scope_cache = None
+
+    def __update_config(self):
+        self.update_config(
+            {
+                "enabled": self._enabled,
+                "notify": self._notify,
+                "onlyonce": self._onlyonce,
+                "clear_history": self._clear_history,
+                "dry_run": self._dry_run,
+                "force_hardlink_cleanup": self._force_hardlink_cleanup,
+                "cron": self._cron,
+                "cooldown_minutes": self._cooldown_minutes,
+                "monitor_download": self._monitor_download,
+                "monitor_library": self._monitor_library,
+                "monitor_downloader": self._monitor_downloader,
+                "trigger_flow": self._trigger_flow,
+                "download_threshold_mode": self._download_threshold_mode,
+                "download_threshold_value": self._format_threshold_value(
+                    self._download_threshold_value,
+                    self._download_threshold_mode,
+                ),
+                "library_threshold_mode": self._library_threshold_mode,
+                "library_threshold_value": self._format_threshold_value(
+                    self._library_threshold_value,
+                    self._library_threshold_mode,
+                ),
+                "downloaders": self._downloaders,
+                "seeding_days": self._seeding_days,
+                "media_flow_seed_check": self._media_flow_seed_check,
+                "max_delete_items": self._max_delete_items,
+                "max_gb_per_run": self._max_gb_per_run,
+                "max_gb_per_day": self._max_gb_per_day,
+                "protect_recent_days": self._protect_recent_days,
+                "media_cleanup_priority": self._media_cleanup_priority,
+                "tv_complete_only": self._tv_complete_only,
+                "prefer_playback_history": self._prefer_playback_history,
+                "clean_media_data": self._clean_media_data,
+                "clean_scrape_data": self._clean_scrape_data,
+                "clean_downloader_seed": self._clean_downloader_seed,
+                "delete_downloader_files": self._delete_downloader_files,
+                "clean_transfer_history": self._clean_transfer_history,
+                "clean_download_history": self._clean_download_history,
+                "clean_empty_media_dirs": self._clean_empty_media_dirs,
+                "empty_media_exts": self._empty_media_exts,
+                "path_allowlist": "\n".join(self._path_allowlist),
+                "path_blocklist": "\n".join(self._path_blocklist),
+                "path_block_keywords": ",".join(self._path_block_keywords),
+                "media_path_mapping": "\n".join(self._media_path_mapping),
+                "refresh_mediaserver": self._refresh_mediaserver,
+                "refresh_mode": self._refresh_mode,
+                "refresh_batch_size": self._refresh_batch_size,
+                "media_servers": self._media_servers,
+                "media_libraries": self._media_libraries,
+                "refresh_servers": self._media_servers,
+                "enable_retry_queue": self._enable_retry_queue,
+                "retry_max_attempts": self._retry_max_attempts,
+                "retry_interval_minutes": self._retry_interval_minutes,
+                "retry_batch_size": self._retry_batch_size,
+            }
+        )

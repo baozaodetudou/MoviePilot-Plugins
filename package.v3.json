@@ -1,0 +1,16 @@
+{
+    "DiskCleaner": {
+        "name": "磁盘清理",
+        "description": "按磁盘阈值与做种时长自动清理媒体、做种与 MP 整理记录。",
+        "version": "3.0.0",
+        "icon": "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/main/icons/diskclean.png",
+        "color": "#4CAF50",
+        "author": "逗猫",
+        "level": 1,
+        "system_version": ">=3.0.0",
+        "release": true,
+        "history": {
+            "v3.0.0": "V3 专用实现，修复整理记录查询、媒体身份与播放时间读取，保留原有清理配置。"
+        }
+    }
+}
