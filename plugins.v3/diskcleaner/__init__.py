@@ -37,7 +37,7 @@ class DiskCleaner(_PluginBase):
     plugin_name = "磁盘清理"
     plugin_desc = "按磁盘阈值与做种时长自动清理媒体、做种与MP整理记录"
     plugin_icon = "https://raw.githubusercontent.com/baozaodetudou/MoviePilot-Plugins/refs/heads/main/icons/diskclean.png"
-    plugin_version = "3.0.0"
+    plugin_version = "3.0.1"
     plugin_author = "逗猫"
     author_url = "https://github.com/baozaodetudou"
     plugin_doc_url = "https://github.com/baozaodetudou/MoviePilot-Plugins/blob/main/plugins.v3/diskcleaner/USAGE.md"
@@ -325,9 +325,10 @@ class DiskCleaner(_PluginBase):
         self.save_data("risk_notice_acked", True)
         return {"success": True}
 
-    def _trigger_manual_clean(self):
+    def _trigger_manual_clean(self) -> Dict[str, Any]:
+        """页面事件使用宿主普通 API 客户端，响应必须包含完整 envelope。"""
         if self._lock.locked():
-            return {"success": False, "message": "任务正在执行中，请稍后重试"}
+            return {"success": False, "message": "任务正在执行中，请稍后重试", "data": None}
 
         def _runner():
             try:
@@ -340,7 +341,7 @@ class DiskCleaner(_PluginBase):
             name=f"{self.__class__.__name__}-manual-run",
             daemon=True,
         ).start()
-        return {"success": True, "message": "已触发手动清理任务，请稍后刷新查看结果"}
+        return {"success": True, "message": "已触发手动清理任务，请稍后刷新查看结果", "data": None}
 
     def _tail_plugin_logs(self):
         log_file = Path(settings.LOG_PATH) / "moviepilot.log"

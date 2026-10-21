@@ -2,10 +2,13 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from tests._bootstrap import prepare
 
@@ -13,6 +16,7 @@ prepare()
 
 from app.application import query as query_module  # noqa: E402
 from app.application.query import DataQueryService  # noqa: E402
+from app.adapters.web.plugin.routes import FastAPIDynamicRouteRegistry  # noqa: E402
 from app.db.adapters.query import SqlAlchemyDataQueryAdapter  # noqa: E402
 from app.db.models.transferhistory import TransferHistory  # noqa: E402
 from app.db.oper.transferhistory import TransferHistoryOper  # noqa: E402
@@ -118,6 +122,51 @@ def test_enabled_plugin_registers_automatic_job(cleaner, monkeypatch):
     assert cleaner._scheduler is not None
     assert cleaner._scheduler.running
     assert any(job.func.__self__ is cleaner for job in cleaner._scheduler.get_jobs())
+
+
+@pytest.mark.v3
+def test_manual_clean_api_returns_complete_page_response(cleaner, monkeypatch):
+    """真实插件 HTTP 路由的成功和占用响应都满足页面客户端的 envelope 契约。"""
+    completed = Event()
+    task = Mock(side_effect=lambda manual_run: completed.set())
+    monkeypatch.setattr(cleaner, "_task", task)
+    cleaner._lock = Lock()
+    app = FastAPI()
+    routes = FastAPIDynamicRouteRegistry(
+        app=app,
+        plugin_ids=lambda: ["DiskCleaner"],
+        plugin_apis=lambda _plugin_id: cleaner.get_api(),
+        verify_token=lambda: None,
+        verify_apikey=lambda: None,
+        prefix="/api/v1/plugin/DiskCleaner",
+        log=Mock(),
+    )
+    routes.update("DiskCleaner", "add")
+    client = TestClient(app)
+
+    accepted_response = client.get("/api/v1/plugin/DiskCleaner/clean")
+
+    assert completed.wait(timeout=2)
+    task.assert_called_once_with(manual_run=True)
+    assert accepted_response.status_code == 200
+    assert accepted_response.json() == {
+        "success": True,
+        "message": "已触发手动清理任务，请稍后刷新查看结果",
+        "data": None,
+    }
+
+    cleaner._lock.acquire()
+    try:
+        busy_response = client.get("/api/v1/plugin/DiskCleaner/clean")
+    finally:
+        cleaner._lock.release()
+
+    assert busy_response.status_code == 200
+    assert busy_response.json() == {
+        "success": False,
+        "message": "任务正在执行中，请稍后重试",
+        "data": None,
+    }
 
 
 @pytest.mark.v3
